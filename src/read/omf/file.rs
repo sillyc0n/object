@@ -62,6 +62,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     fn scan(&mut self, data: &'data [u8]) -> Result<()> {
         let mut pos = 0;
         let mut last_data_seg_ordinal: Option<u16> = None;
+        // THREAD state persists across successive FIXUPP records for the duration of module scanning.
         let mut thread_table = ThreadTable::new();
         let mut first_record = true;
 
@@ -83,21 +84,14 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 return Err(Error("truncated OMF record header"));
             }
             let record_length = u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as usize;
+            if record_length < 1 {
+                return Err(Error("invalid OMF record length"));
+            }
             if pos + 3 + record_length > data.len() {
                 return Err(Error("truncated OMF record"));
             }
-
-            // Verify checksum.
             let record_bytes = &data[pos..pos + 3 + record_length];
-            let mut sum = 0u8;
-            for &b in record_bytes {
-                sum = sum.wrapping_add(b);
-            }
-            if sum != 0 {
-                // In strict mode we should error, but for now we'll allow it with a warning if we had one.
-                // The spec says sum should be 0.
-            }
-
+            Self::verify_record_checksum(record_bytes, pos, record_type);
             let record_body = &data[pos + 3..pos + 3 + record_length - 1];
 
             match record_type {
@@ -150,6 +144,27 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             let eff_len = if seg.big { 0x10000 } else { seg.length as u64 };
             seg.data.resize(eff_len as usize, 0);
             base += eff_len;
+        }
+    }
+
+    /// Verify the checksum of a single OMF record.
+    ///
+    /// OMF defines the checksum so that the low-order byte of the sum of all
+    /// bytes in the record, including type, length, body, and checksum, is zero.
+    /// Checksum mismatch is treated as non-fatal in `parse()`: it does not stop
+    /// structural decoding, but in debug builds it emits a warning.
+    fn verify_record_checksum(record_bytes: &[u8], pos: usize, record_type: u8) {
+        let mut sum = 0u8;
+        for &b in record_bytes {
+            sum = sum.wrapping_add(b);
+        }
+
+        if sum != 0 {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "warning: OMF checksum mismatch at record offset {:#x}, type {:#04x}",
+                pos, record_type
+            );
         }
     }
 

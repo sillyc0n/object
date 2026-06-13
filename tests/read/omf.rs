@@ -25,6 +25,32 @@ fn omf_minimal() {
 }
 
 #[test]
+fn omf_bad_checksum_is_nonfatal() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x8A, &[0x01]));
+    // Corrupt the THEADR checksum byte.
+    let theadr_checksum = 1 + 2 + 6; // checksum byte of first THEADR record.
+    data[theadr_checksum] ^= 0x01;
+
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.module_name(), b"HELLO");
+}
+
+#[test]
+fn omf_make_record_checksum_sums_to_zero() {
+    let rec = make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']);
+    let sum = rec.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+    assert_eq!(sum, 0);
+}
+
+#[test]
+fn omf_zero_length_record_is_error() {
+    let data = [0x80, 0x00, 0x00];
+    assert!(OmfFile::parse(&data[..]).is_err());
+}
+
+#[test]
 fn omf_sections() {
     let mut data = Vec::new();
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
