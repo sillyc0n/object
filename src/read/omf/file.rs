@@ -721,9 +721,6 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     }
 
     fn parse_comdef(&mut self, body: &'data [u8]) -> Result<()> {
-        if !self.has_ms_ext {
-            return Err(Error("COMDEF record without preceding MS extensions COMENT"));
-        }
         let mut pos = 0;
         while pos < body.len() {
             let (name, c) = omf::read_name(body, pos).read_error("truncated COMDEF name")?;
