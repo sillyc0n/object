@@ -152,7 +152,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 }
                 omf::RT_MODEND => {
                     self.parse_modend(record_body)?;
-                    pos += 3 + record_length;
+                    // pos += 3 + record_length; // this is redundant - MODEND record is, by definition, the last record in an object module
                     break;
                 }
                 omf::RT_COMENT => {
@@ -251,7 +251,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 return Err(Error("truncated SEGDEF absolute fields"));
             }
             frame = u16::from_le_bytes([body[pos], body[pos + 1]]);
-            pos += 3;
+            pos += 3; // skips 2 (frame) + 1 (offset, ignored by LINK)
         }
 
         if pos + 2 > body.len() {
