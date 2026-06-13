@@ -88,6 +88,7 @@ pub mod build;
 
 #[cfg(feature = "archive")]
 pub mod archive;
+pub mod omf;
 #[cfg(feature = "elf")]
 pub mod elf;
 #[cfg(feature = "macho")]

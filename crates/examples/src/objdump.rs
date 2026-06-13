@@ -136,6 +136,10 @@ fn dump_parsed_object<W: Write, E: Write>(w: &mut W, e: &mut E, file: &object::F
     )?;
     writeln!(w, "Entry Address: {:x?}", file.entry())?;
 
+    if let object::File::Omf(omf) = file {
+        dump_omf_details(w, e, omf)?;
+    }
+
     match file.mach_uuid() {
         Ok(Some(uuid)) => writeln!(w, "Mach UUID: {:x?}", uuid)?,
         Ok(None) => {}
@@ -263,6 +267,164 @@ fn dump_parsed_object<W: Write, E: Write>(w: &mut W, e: &mut E, file: &object::F
         )?;
     }
 
+    Ok(())
+}
+
+fn dump_omf_details<W: Write, E: Write>(
+    w: &mut W,
+    _e: &mut E,
+    file: &object::read::omf::OmfFile,
+) -> Result<()> {
+    writeln!(w, "\nOMF details:")?;
+    for record in file.fixupp_records() {
+        let seg_name = record.attached_seg_ordinal.and_then(|ord| {
+            file.segments
+                .get(ord as usize - 1)
+                .and_then(|seg| file.lname(seg.name_idx))
+        });
+        writeln!(
+            w,
+            "FIXUPP record (attached to segment: {:?})",
+            seg_name.map(String::from_utf8_lossy).unwrap_or_else(|| "none".into())
+        )?;
+        for sub in &record.subrecords {
+            match sub {
+                object::read::omf::ParsedFixuppSubrecord::Thread(t) => {
+                    let kind_str = match t.kind {
+                        object::read::omf::ThreadKind::Frame => "FRAME",
+                        object::read::omf::ThreadKind::Target => "TARGET",
+                    };
+                    let method_name = match t.kind {
+                        object::read::omf::ThreadKind::Frame => match t.method {
+                            0 => "segment index",
+                            1 => "group index",
+                            2 => "external index",
+                            4 => "segment containing LOCATION",
+                            5 => "TARGET's segment/group/external index",
+                            _ => "unknown",
+                        },
+                        object::read::omf::ThreadKind::Target => match t.method {
+                            0 => "segment index",
+                            1 => "group index",
+                            2 => "external index",
+                            _ => "unknown",
+                        },
+                    };
+                    write!(
+                        w,
+                        "  THREAD {}[{}]: method={} ({})",
+                        kind_str, t.thread_number, t.method, method_name
+                    )?;
+                    if let Some(datum) = t.datum {
+                        let datum_name = match t.kind {
+                            object::read::omf::ThreadKind::Frame => match t.method {
+                                0 => file.segments.get(datum as usize - 1).and_then(|seg| file.lname(seg.name_idx)),
+                                1 => file.groups.get(datum as usize - 1).and_then(|grp| file.lname(grp.name_idx)),
+                                2 => file.extdef_symbol_index(datum).ok().and_then(|idx| file.symbols.get(idx.0)).map(|sym| sym.name),
+                                _ => None,
+                            },
+                            object::read::omf::ThreadKind::Target => match t.method {
+                                0 => file.segments.get(datum as usize - 1).and_then(|seg| file.lname(seg.name_idx)),
+                                1 => file.groups.get(datum as usize - 1).and_then(|grp| file.lname(grp.name_idx)),
+                                2 => file.extdef_symbol_index(datum).ok().and_then(|idx| file.symbols.get(idx.0)).map(|sym| sym.name),
+                                _ => None,
+                            },
+                        };
+                        write!(w, ", datum={}", datum)?;
+                        if let Some(name) = datum_name {
+                            write!(w, " -> {}", String::from_utf8_lossy(name))?;
+                        }
+                    } else {
+                        write!(w, ", no datum")?;
+                    }
+                    writeln!(w)?;
+                }
+                object::read::omf::ParsedFixuppSubrecord::Fixup(f) => {
+                    writeln!(
+                        w,
+                        "  FIXUP @{:04X}: M={} {} loc={}({}) fixdat={:02X}",
+                        f.record_offset,
+                        if f.is_seg_rel { 1 } else { 0 },
+                        if f.is_seg_rel { "segment-relative" } else { "self-relative" },
+                        f.loc_raw,
+                        match f.loc_raw as u16 {
+                            object::omf::LOC_BYTE => "byte",
+                            object::omf::LOC_OFFSET => "offset",
+                            object::omf::LOC_SEGMENT => "segment",
+                            object::omf::LOC_POINTER => "pointer",
+                            object::omf::LOC_HIGH_BYTE => "high-order byte",
+                            object::omf::LOC_LOADER_OFFSET => "loader-resolved offset",
+                            _ => "unknown",
+                        },
+                        f.fixdat
+                    )?;
+
+                    let frame_method_name = match f.frame_method {
+                        0 => "segment index",
+                        1 => "group index",
+                        2 => "external index",
+                        3 => "frame number",
+                        4 => "segment containing LOCATION",
+                        5 => "TARGET's segment/group/external index",
+                        _ => "unknown",
+                    };
+                    if let Some(thread_num) = f.frame_thread {
+                        write!(w, "    FRAME: thread FRAME[{}] -> ", thread_num)?;
+                    } else {
+                        write!(w, "    FRAME: explicit ")?;
+                    }
+                    write!(w, "method={} ({})", f.frame_method, frame_method_name)?;
+                    if let Some(datum) = f.frame_datum {
+                        let datum_name = match f.frame_method {
+                            0 => file.segments.get(datum as usize - 1).and_then(|seg| file.lname(seg.name_idx)),
+                            1 => file.groups.get(datum as usize - 1).and_then(|grp| file.lname(grp.name_idx)),
+                            2 => file.extdef_symbol_index(datum).ok().and_then(|idx| file.symbols.get(idx.0)).map(|sym| sym.name),
+                            _ => None,
+                        };
+                        write!(w, ", datum={}", datum)?;
+                        if let Some(name) = datum_name {
+                            write!(w, " -> {}", String::from_utf8_lossy(name))?;
+                        }
+                    } else if f.frame_method <= 2 {
+                        write!(w, ", MISSING datum")?;
+                    }
+                    writeln!(w)?;
+
+                    let target_method_name = match f.target_method {
+                        0 => "segment index",
+                        1 => "group index",
+                        2 => "external index",
+                        3 => "frame number",
+                        4 => "segment index, no displacement",
+                        5 => "group index, no displacement",
+                        6 => "external index, no displacement",
+                        _ => "unknown",
+                    };
+                    if let Some(thread_num) = f.target_thread {
+                        write!(w, "    TARGET: thread TARGET[{}] -> effective ", thread_num)?;
+                    } else {
+                        write!(w, "    TARGET: explicit ")?;
+                    }
+                    write!(w, "method={} ({})", f.target_method, target_method_name)?;
+                    let datum = f.target_datum;
+                    let datum_name = match f.target_method & 0x03 {
+                        0 => file.segments.get(datum as usize - 1).and_then(|seg| file.lname(seg.name_idx)),
+                        1 => file.groups.get(datum as usize - 1).and_then(|grp| file.lname(grp.name_idx)),
+                        2 => file.extdef_symbol_index(datum).ok().and_then(|idx| file.symbols.get(idx.0)).map(|sym| sym.name),
+                        _ => None,
+                    };
+                    write!(w, ", datum={}", datum)?;
+                    if let Some(name) = datum_name {
+                        write!(w, " -> {}", String::from_utf8_lossy(name))?;
+                    }
+                    if let Some(disp) = f.target_displacement {
+                        write!(w, ", displacement={:04X}", disp)?;
+                    }
+                    writeln!(w)?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 

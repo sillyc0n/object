@@ -45,6 +45,8 @@ pub enum Architecture {
     Wasm32,
     Wasm64,
     Xtensa,
+    /// Intel 8086/8088 with 16-bit segmented addressing.
+    X86_16,
 }
 
 /// A CPU sub-architecture.
@@ -98,6 +100,7 @@ impl Architecture {
             Architecture::Wasm64 => Some(AddressSize::U64),
             Architecture::Xtensa => Some(AddressSize::U32),
             Architecture::SuperH => Some(AddressSize::U32),
+            Architecture::X86_16 => Some(AddressSize::U16),
         }
     }
 }
@@ -135,6 +138,8 @@ pub enum BinaryFormat {
     Pe,
     Wasm,
     Xcoff,
+    /// Intel/Microsoft Object Module Format (16-bit, for 8086/DOS .OBJ files).
+    Omf,
 }
 
 impl BinaryFormat {

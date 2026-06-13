@@ -97,6 +97,9 @@ pub mod elf;
 #[cfg(feature = "macho")]
 pub mod macho;
 
+/// Intel/Microsoft OMF16 object file support.
+pub mod omf;
+
 #[cfg(feature = "pe")]
 pub mod pe;
 
@@ -262,6 +265,10 @@ pub enum FileKind {
     /// See [`xcoff::XcoffFile64`].
     #[cfg(feature = "xcoff")]
     Xcoff64,
+    /// An OMF object file.
+    ///
+    /// See [`omf::OmfFile`].
+    Omf,
 }
 
 impl FileKind {
@@ -344,10 +351,32 @@ impl FileKind {
             [0x01, 0xdf, ..] => FileKind::Xcoff32,
             #[cfg(feature = "xcoff")]
             [0x01, 0xf7, ..] => FileKind::Xcoff64,
+            _ if detect_omf(magic) => FileKind::Omf,
             _ => return Err(Error("Unknown file magic")),
         };
         Ok(kind)
     }
+}
+
+fn detect_omf(data: &[u8]) -> bool {
+    // An OMF object module always starts with a THEADR record (0x80).
+    if data[0] != crate::omf::RT_THEADR {
+        return false;
+    }
+    let record_len = u16::from_le_bytes([data[1], data[2]]) as usize;
+    if record_len < 2 {
+        return false;
+    }
+    // We only have the first 16 bytes of the file in `data`.
+    // If the record is longer than 16, we can't fully validate it here,
+    // but we can check the name length if it fits.
+    if record_len + 3 <= data.len() {
+        let name_len = data[3] as usize;
+        if 1 + name_len + 1 > record_len {
+            return false;
+        }
+    }
+    true
 }
 
 /// An object kind.
