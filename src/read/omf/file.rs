@@ -200,8 +200,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         pos += c;
         let (_overlay_idx, c) =
             omf::read_index(body, pos).read_error("truncated SEGDEF overlay")?;
-        let _ = c;
-        // pos += c;
+        pos += c;
+
+        if pos != body.len() {
+            return Err(Error("unexpected trailing bytes in SEGDEF"));
+        }
 
         let alignment = match a_field {
             omf::ALIGN_ABSOLUTE => 1u32,
@@ -587,6 +590,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 return Err(Error("truncated MODEND target displacement"));
             }
             let d = u16::from_le_bytes([body[pos], body[pos + 1]]);
+            pos += 2;
             d
         } else {
             0
@@ -613,6 +617,10 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 return Err(Error("MODEND target method unsupported"));
             }
         };
+
+        if pos != body.len() {
+            return Err(Error("unexpected trailing bytes in MODEND"));
+        }
 
         Ok(())
     }

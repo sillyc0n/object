@@ -404,3 +404,27 @@ fn omf_modend_external_start_is_error() {
     data.extend(make_record(0x8A, &[0xC1, 0x06, 0x01, 0x01]));
     assert!(OmfFile::parse(&data[..]).is_err());
 }
+
+#[test]
+fn omf_segdef_rejects_trailing_bytes() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    // SEGDEF body with an extra trailing byte (0xAA)
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01, 0xAA]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let result = OmfFile::parse(&data[..]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn omf_modend_rejects_trailing_bytes() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // MODEND body with an extra trailing byte (0xBB)
+    data.extend(make_record(0x8A, &[0xC1, 0x40, 0x01, 0x23, 0x01, 0xBB]));
+    let result = OmfFile::parse(&data[..]);
+    assert!(result.is_err());
+}
