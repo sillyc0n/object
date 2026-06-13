@@ -459,7 +459,7 @@ fn omf_modend_rejects_trailing_bytes() {
 }
 
 #[test]
-fn omf_target_thread_rejects_methods_4_5_6() {
+fn omf_target_thread_accepts_methods_4_5_6() {
     for method in [4u8, 5, 6] {
         let mut data = Vec::new();
         data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
@@ -477,7 +477,7 @@ fn omf_target_thread_rejects_methods_4_5_6() {
         data.extend(make_record(0x8A, &[0x01]));
 
         let result = OmfFile::parse(&data[..]);
-        assert!(result.is_err(), "TARGET thread method {} should be rejected", method);
+        assert!(result.is_ok(), "TARGET thread method {} should be accepted", method);
     }
 }
 

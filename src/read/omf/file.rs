@@ -837,7 +837,7 @@ fn parse_thread_subrecord(
         // 0=segment, 1=group, 2=external.
         // The consuming fixup's P bit supplies the high method bit later
         // when reconstructing the effective target method.
-        matches!(method, 0 | 1 | 2)
+        matches!(method, 0 | 1 | 2 | 4 | 5 | 6)
     };
     if !valid {
         return Err(Error("invalid THREAD method"));
