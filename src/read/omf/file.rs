@@ -62,6 +62,8 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     fn scan(&mut self, data: &'data [u8]) -> Result<()> {
         let mut pos = 0;
         let mut last_data_seg_ordinal: Option<u16> = None;
+        // Tracks whether the most recently processed record was LEDATA/LIDATA.
+        let mut prev_was_data_record = false;
         // THREAD state persists across successive FIXUPP records for the duration of module scanning.
         let mut thread_table = ThreadTable::new();
         let mut first_record = true;
@@ -95,36 +97,78 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             let record_body = &data[pos + 3..pos + 3 + record_length - 1];
 
             match record_type {
-                omf::RT_THEADR => self.parse_theadr(record_body)?,
-                omf::RT_LNAMES => self.parse_lnames(record_body)?,
-                omf::RT_SEGDEF => self.parse_segdef(record_body)?,
-                omf::RT_GRPDEF => self.parse_grpdef(record_body)?,
-                omf::RT_EXTDEF => self.parse_extdef(record_body)?,
-                omf::RT_TYPDEF => self.parse_typdef(record_body)?,
-                omf::RT_PUBDEF => self.parse_pubdef(record_body)?,
-                omf::RT_LINNUM => self.parse_linnum(record_body)?,
-                omf::RT_COMDEF => self.parse_comdef(record_body)?,
+                omf::RT_THEADR => {
+                    self.parse_theadr(record_body)?;
+                    prev_was_data_record = false;
+                }
+                omf::RT_LNAMES => {
+                    self.parse_lnames(record_body)?;
+                    prev_was_data_record = false;
+                }
+                omf::RT_SEGDEF => {
+                    self.parse_segdef(record_body)?;
+                    prev_was_data_record = false;
+                }
+                omf::RT_GRPDEF => {
+                    self.parse_grpdef(record_body)?;
+                    prev_was_data_record = false;
+                }
+                omf::RT_EXTDEF => {
+                    self.parse_extdef(record_body)?;
+                    prev_was_data_record = false;
+                }
+                omf::RT_TYPDEF => {
+                    self.parse_typdef(record_body)?;
+                    prev_was_data_record = false;
+                }
+                omf::RT_PUBDEF => {
+                    self.parse_pubdef(record_body)?;
+                    prev_was_data_record = false;
+                }
+                omf::RT_LINNUM => {
+                    self.parse_linnum(record_body)?;
+                    prev_was_data_record = false;
+                }
+                omf::RT_COMDEF => {
+                    self.parse_comdef(record_body)?;
+                    prev_was_data_record = false;
+                }
                 omf::RT_LEDATA => {
                     let ord = self.parse_ledata(record_body)?;
                     last_data_seg_ordinal = Some(ord);
+                    prev_was_data_record = true;
                 }
                 omf::RT_LIDATA => {
                     let ord = self.parse_lidata(record_body)?;
                     last_data_seg_ordinal = Some(ord);
+                    prev_was_data_record = true;
                 }
                 omf::RT_FIXUPP => {
-                    self.parse_fixupp(record_body, last_data_seg_ordinal, &mut thread_table)?
+                    self.parse_fixupp(record_body, last_data_seg_ordinal, &mut thread_table)?;
+                    // A FIXUPP record consumes the "immediately follows" slot;
+                    // anything after it (until the next LEDATA/LIDATA) is no
+                    // longer adjacent to data.
+                    prev_was_data_record = false;
                 }
                 omf::RT_MODEND => {
                     self.parse_modend(record_body)?;
                     pos += 3 + record_length;
-                    if pos < data.len() {
-                        // Trailing data after MODEND? Spec says it's the last record.
-                    }
                     break;
                 }
-                omf::RT_COMENT => self.parse_coment(record_body)?,
-                _ => {}
+                omf::RT_COMENT => {
+                    // COMENT cannot appear between a FIXUPP record and the
+                    // LEDATA/LIDATA it refers to.
+                    if prev_was_data_record {
+                        return Err(Error(
+                            "COMENT record cannot appear between LEDATA/LIDATA and its FIXUPP",
+                        ));
+                    }
+                    self.parse_coment(record_body)?;
+                    prev_was_data_record = false;
+                }
+                _ => {
+                    prev_was_data_record = false;
+                }
             }
 
             pos += 3 + record_length;
@@ -136,14 +180,21 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     fn finalize(&mut self) {
         let mut base = 0u64;
         for seg in &mut self.segments {
-            let alignment = seg.alignment as u64;
-            if alignment > 1 {
-                base = (base + (alignment - 1)) & !(alignment - 1);
+            if seg.is_absolute {
+                // Absolute segment: address is fixed by its declared frame number.
+                seg.flat_base = (seg.frame as u64) << 4;
+            } else {
+                let alignment = seg.alignment as u64;
+                if alignment > 1 {
+                    base = (base + (alignment - 1)) & !(alignment - 1);
+                }
+                seg.flat_base = base;
+                let eff_len = if seg.big { 0x10000 } else { seg.length as u64 };
+                base += eff_len;
             }
-            seg.flat_base = base;
+
             let eff_len = if seg.big { 0x10000 } else { seg.length as u64 };
             seg.data.resize(eff_len as usize, 0);
-            base += eff_len;
         }
     }
 
@@ -254,6 +305,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             data: Vec::new(),
             relocs: Vec::new(),
             ordinal,
+            is_absolute: a_field == omf::ALIGN_ABSOLUTE,
             flat_base: 0,
             _marker: PhantomData,
         });
@@ -270,12 +322,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
         let mut members = Vec::new();
         while pos < body.len() {
-            let component = *body.get(pos).read_error("truncated GRPDEF component")?;
+            // Consume the type byte. Per spec, LINK ignores its value (only 0xFF
+            // is officially "segment index", but other Intel-defined types
+            // 0xFE/0xFD/0xFB/0xFA are treated the same way by LINK).
+            let _component_type = *body.get(pos).read_error("truncated GRPDEF component")?;
             pos += 1;
-
-            if component != 0xFF {
-                return Err(Error("GRPDEF component is not a segment index"));
-            }
 
             let (seg_idx, c) = omf::read_index(body, pos).read_error("truncated GRPDEF member")?;
             pos += c;
@@ -324,18 +375,54 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
     fn parse_typdef(&mut self, body: &'data [u8]) -> Result<()> {
         let mut pos = 0;
+
+        // The name field is always a single null byte (p.665).
+        if pos >= body.len() {
+            return Err(Error("truncated TYPDEF name"));
+        }
+        if body[pos] != 0x00 {
+            return Err(Error("TYPDEF name field must be null"));
+        }
+        pos += 1;
+
+        // Parse the eight-leaf descriptor: a sequence of leaf descriptors.
         while pos < body.len() {
-            let (name, c) = omf::read_name(body, pos).read_error("truncated TYPDEF name")?;
-            pos += c;
-            if !name.is_empty() {
-                let (_, c) = omf::read_index(body, pos).read_error("truncated TYPDEF index")?;
-                pos += c;
-            } else {
-                // If name is empty, there's still an index datum (either 1 or 2 bytes).
-                let (_, c) = omf::read_index(body, pos).read_error("truncated TYPDEF index datum")?;
-                pos += c;
+            let tag = body[pos];
+            pos += 1;
+
+            match tag {
+                0x62 => {
+                    // NEAR variable: 62H variable_type length_in_bits
+                    if pos >= body.len() {
+                        return Err(Error("truncated TYPDEF NEAR variable type"));
+                    }
+                    let _variable_type = body[pos]; // 77H/79H/7BH, ignored by LINK
+                    pos += 1;
+
+                    let (_length_in_bits, c) = omf::read_varlen(body, pos)
+                        .read_error("truncated TYPDEF length_in_bits")?;
+                    pos += c;
+                }
+                0x61 => {
+                    // FAR variable: 61H variable_type number_of_elements element_type_index
+                    if pos >= body.len() {
+                        return Err(Error("truncated TYPDEF FAR variable type"));
+                    }
+                    let _variable_type = body[pos]; // restricted to 77H (array)
+                    pos += 1;
+
+                    let (_number_of_elements, c) = omf::read_varlen(body, pos)
+                        .read_error("truncated TYPDEF number_of_elements")?;
+                    pos += c;
+
+                    let (_element_type_index, c) = omf::read_index(body, pos)
+                        .read_error("truncated TYPDEF element_type_index")?;
+                    pos += c;
+                }
+                _ => return Err(Error("unrecognized TYPDEF leaf descriptor tag")),
             }
         }
+
         Ok(())
     }
 
@@ -378,8 +465,14 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
     fn parse_linnum(&mut self, body: &'data [u8]) -> Result<()> {
         let mut pos = 0;
-        let (_group_idx, c) = omf::read_index(body, pos).read_error("truncated LINNUM group")?;
-        pos += c;
+
+        // group_index is always a single zero byte (p.672).
+        let group_index = *body.get(pos).read_error("truncated LINNUM group index")?;
+        if group_index != 0 {
+            return Err(Error("LINNUM group index must be zero"));
+        }
+        pos += 1;
+
         let (_seg_idx, c) = omf::read_index(body, pos).read_error("truncated LINNUM segment")?;
         pos += c;
 
@@ -405,6 +498,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         }
         let data_offset = u16::from_le_bytes([body[c], body[c + 1]]) as usize;
         let data_bytes = &body[c + 2..];
+
+        // Spec limit: data field max 1024 bytes.
+        if data_bytes.len() > 1024 {
+            return Err(Error("LEDATA data field exceeds 1024-byte LINK limit"));
+        }
 
         let seg = &mut self.segments[seg_idx as usize - 1];
 
@@ -432,6 +530,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         }
         let data_offset = u16::from_le_bytes([body[c], body[c + 1]]) as usize;
         let block_data = &body[c + 2..];
+
+        // Spec limit: an iterated data block max 512 bytes.
+        if block_data.len() > 512 {
+            return Err(Error("LIDATA iterated data block exceeds 512-byte LINK limit"));
+        }
 
         let (expanded, _) = expand_lidata(block_data, 0, 0)?;
 
@@ -476,35 +579,6 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 let rec_offset = (locat & omf::LOCAT_OFFSET_MASK) as u16;
 
                 let loc = match loc_raw as u16 {
-                    omf::LOC_HIGH_BYTE => {
-                        let fixdat = *body.get(pos).read_error("truncated FIXUPP fix_dat")?;
-                        let mut sub_pos = pos;
-                        let frame = resolve_frame_from_fixdat(body, &mut sub_pos, fixdat, thread_table)?;
-                        let target = resolve_target_from_fixdat(body, &mut sub_pos, fixdat, thread_table)?;
-                        let mut target_displacement = None;
-                        if target.method <= 2 {
-                            if sub_pos + 2 > body.len() {
-                                return Err(Error("truncated FIXUPP displacement"));
-                            }
-                            target_displacement = Some(u16::from_le_bytes([body[sub_pos], body[sub_pos + 1]]));
-                        }
-                        subrecords.push(ParsedFixuppSubrecord::Fixup(ParsedFixupSubrecord {
-                            record_offset: rec_offset,
-                            loc_raw,
-                            loc: loc_raw, // or some value indicating skip
-                            is_seg_rel,
-                            fixdat,
-                            frame_thread: frame.thread_num,
-                            frame_method: frame.method,
-                            frame_datum: frame.datum,
-                            target_thread: target.thread_num,
-                            target_method: target.method,
-                            target_datum: target.datum,
-                            target_displacement,
-                        }));
-                        pos = advance_past_fixup(body, pos, thread_table)?;
-                        continue;
-                    }
                     omf::LOC_LOADER_OFFSET => omf::LOC_OFFSET as u8,
                     other => other as u8,
                 };
@@ -515,17 +589,21 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 let fix_dat = body[pos];
                 pos += 1;
 
-                let frame = resolve_frame_from_fixdat(body, &mut pos, fix_dat, thread_table)?;
-                let target = resolve_target_from_fixdat(body, &mut pos, fix_dat, thread_table)?;
+                let mut sub_pos = pos;
+                let frame = resolve_frame_from_fixdat(body, &mut sub_pos, fix_dat, thread_table)?
+                    .ok_or(Error("FIXUPP frame method unsupported"))?;
+                let target = resolve_target_from_fixdat(body, &mut sub_pos, fix_dat, thread_table)?
+                    .ok_or(Error("FIXUPP target method unsupported"))?;
 
                 let mut target_displacement = None;
-                if target.method <= 2 {
-                    if pos + 2 > body.len() {
+                if (target.method & 0x04) == 0 {
+                    if sub_pos + 2 > body.len() {
                         return Err(Error("truncated FIXUPP displacement"));
                     }
-                    target_displacement = Some(u16::from_le_bytes([body[pos], body[pos + 1]]));
-                    pos += 2;
+                    target_displacement = Some(u16::from_le_bytes([body[sub_pos], body[sub_pos + 1]]));
+                    sub_pos += 2;
                 }
+                pos = sub_pos;
 
                 subrecords.push(ParsedFixuppSubrecord::Fixup(ParsedFixupSubrecord {
                     record_offset: rec_offset,
@@ -538,27 +616,28 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     frame_datum: frame.datum,
                     target_thread: target.thread_num,
                     target_method: target.method,
-                    target_datum: target.datum,
+                    target_datum: target.datum.unwrap_or(0),
                     target_displacement,
                 }));
 
-                let reloc_target = match target.method & 0x03 {
-                    0 => RelocTarget::Segment(target.datum),
-                    1 => RelocTarget::Group(target.datum),
-                    2 => RelocTarget::External(target.datum),
-                    _ => continue,
-                };
-
-                let seg_ordinal =
-                    last_seg_ordinal.ok_or(Error("FIXUPP with no preceding data record"))?;
-                let seg = &mut self.segments[seg_ordinal as usize - 1];
-                seg.relocs.push(ParsedReloc {
-                    offset: rec_offset,
-                    loc,
-                    is_seg_rel,
-                    target: reloc_target,
-                    displacement: target_displacement.unwrap_or(0),
-                });
+                if loc != 4 {
+                    let reloc_target = match target.method & 0x03 {
+                        0 => RelocTarget::Segment(target.datum.unwrap_or(0)),
+                        1 => RelocTarget::Group(target.datum.unwrap_or(0)),
+                        2 => RelocTarget::External(target.datum.unwrap_or(0)),
+                        _ => continue,
+                    };
+                    let seg_ordinal =
+                        last_seg_ordinal.ok_or(Error("FIXUPP with no preceding data record"))?;
+                    let seg = &mut self.segments[seg_ordinal as usize - 1];
+                    seg.relocs.push(ParsedReloc {
+                        offset: rec_offset,
+                        loc,
+                        is_seg_rel,
+                        target: reloc_target,
+                        displacement: target_displacement.unwrap_or(0),
+                    });
+                }
             }
         }
 
@@ -591,16 +670,17 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         let end_dat = *body.get(pos).read_error("truncated MODEND start address")?;
         pos += 1;
 
-        // Threads are not allowed for start address.
-        if end_dat & (omf::FIXDAT_F_BIT | omf::FIXDAT_T_BIT) != 0 {
-            return Err(Error("MODEND thread bit set; not allowed in start address"));
+        // Spec: bit 2 (the P bit) of end_dat must be zero in MODEND.
+        if end_dat & omf::FIXDAT_P_BIT != 0 {
+            return Err(Error("MODEND end_dat P bit must be zero"));
         }
 
         let empty_threads = ThreadTable::new();
         let _frame = resolve_frame_from_fixdat(body, &mut pos, end_dat, &empty_threads)?;
-        let target = resolve_target_from_fixdat(body, &mut pos, end_dat, &empty_threads)?;
+        let target = resolve_target_from_fixdat(body, &mut pos, end_dat, &empty_threads)?
+            .ok_or(Error("MODEND target method unsupported"))?;
 
-        let displacement = if target.method <= 2 {
+        let displacement = if (target.method & 0x04) == 0 {
             if pos + 2 > body.len() {
                 return Err(Error("truncated MODEND target displacement"));
             }
@@ -612,11 +692,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         };
 
         self.entry = match target.method {
-            0 | 4 => Some((target.datum, displacement)),
+            0 | 4 => Some((target.datum.unwrap_or(0), displacement)),
             1 | 5 => {
                 let grp = self
                     .groups
-                    .get(target.datum as usize - 1)
+                    .get(target.datum.unwrap_or(0) as usize - 1)
                     .ok_or(Error("MODEND group index out of range"))?;
                 let seg = grp
                     .members
@@ -753,7 +833,11 @@ fn parse_thread_subrecord(
     let valid = if is_frame {
         matches!(method, 0 | 1 | 2 | 4 | 5)
     } else {
-        matches!(method, 0 | 1 | 2 | 4 | 5 | 6)
+        // TARGET threads store only the base target kind:
+        // 0=segment, 1=group, 2=external.
+        // The consuming fixup's P bit supplies the high method bit later
+        // when reconstructing the effective target method.
+        matches!(method, 0 | 1 | 2)
     };
     if !valid {
         return Err(Error("invalid THREAD method"));
@@ -795,12 +879,15 @@ fn resolve_frame_from_fixdat(
     pos: &mut usize,
     fixdat: u8,
     thread_table: &ThreadTable,
-) -> Result<ResolvedFrame> {
+) -> Result<Option<ResolvedFrame>> { // Returns None for unsupported methods
     let f_bit = (fixdat & omf::FIXDAT_F_BIT) != 0;
     let frame_f = (fixdat & omf::FIXDAT_FRAME_MASK) >> omf::FIXDAT_FRAME_SHIFT;
 
     if !f_bit {
         let method = frame_f;
+        if method == 3 {
+            return Err(Error("FIXUPP explicit-frame-number frame (method 3) is unsupported"));
+        }
         let datum = if method <= 2 {
             let (idx, c) = omf::read_index(body, *pos).read_error("truncated fixup frame datum")?;
             *pos += c;
@@ -808,29 +895,32 @@ fn resolve_frame_from_fixdat(
         } else {
             None
         };
-        Ok(ResolvedFrame {
+        Ok(Some(ResolvedFrame {
             method,
             datum,
             thread_num: None,
-        })
+        }))
     } else {
         let thread_num = frame_f as u8;
         let te = thread_table.frame[thread_num as usize]
             .ok_or(Error("FIXUPP references undefined FRAME thread"))?;
+        if te.method == 3 {
+            return Err(Error("FIXUPP explicit-frame-number frame (method 3) is unsupported"));
+        }
         if te.method <= 2 && te.datum.is_none() {
             return Err(Error("FIXUPP frame thread missing datum"));
         }
-        Ok(ResolvedFrame {
+        Ok(Some(ResolvedFrame {
             method: te.method,
             datum: te.datum,
             thread_num: Some(thread_num),
-        })
+        }))
     }
 }
 
 struct ResolvedTarget {
     method: u8,
-    datum: u16,
+    datum: Option<u16>, // Changed to Option to handle skip cases
     thread_num: Option<u8>,
 }
 
@@ -839,37 +929,37 @@ fn resolve_target_from_fixdat(
     pos: &mut usize,
     fixdat: u8,
     thread_table: &ThreadTable,
-) -> Result<ResolvedTarget> {
+) -> Result<Option<ResolvedTarget>> { // Returns None for unsupported methods
     let t_bit = (fixdat & omf::FIXDAT_T_BIT) != 0;
     let p_bit = (fixdat & omf::FIXDAT_P_BIT) != 0;
     let targt = fixdat & omf::FIXDAT_TARGT_MASK;
 
     if !t_bit {
         let method = ((p_bit as u8) << 2) | targt;
-        let datum = match method {
-            0 | 1 | 2 | 4 | 5 | 6 => {
-                let (idx, c) = omf::read_index(body, *pos).read_error("truncated fixup target datum")?;
-                *pos += c;
-                idx
-            }
-            _ => return Err(Error("unsupported FIXUPP target method")),
-        };
-        Ok(ResolvedTarget {
+        if matches!(method, 3 | 7) {
+            return Err(Error("FIXUPP explicit-frame-number target (method 3/7) is unsupported"));
+        }
+        let (idx, c) = omf::read_index(body, *pos).read_error("truncated fixup target datum")?;
+        *pos += c;
+        Ok(Some(ResolvedTarget {
             method,
-            datum,
+            datum: Some(idx),
             thread_num: None,
-        })
+        }))
     } else {
         let thread_num = targt as u8;
         let te = thread_table.target[thread_num as usize]
             .ok_or(Error("FIXUPP references undefined TARGET thread"))?;
-        let method = ((p_bit as u8) << 2) | (te.method & 0x03);
+        let method = ((p_bit as u8) << 2) | te.method;
+        if matches!(method, 3 | 7) {
+            return Err(Error("FIXUPP explicit-frame-number target (method 3/7) is unsupported"));
+        }
         let datum = te.datum.ok_or(Error("FIXUPP target thread missing datum"))?;
-        Ok(ResolvedTarget {
+        Ok(Some(ResolvedTarget {
             method,
-            datum,
+            datum: Some(datum),
             thread_num: Some(thread_num),
-        })
+        }))
     }
 }
 
@@ -909,30 +999,6 @@ fn expand_lidata(data: &[u8], mut pos: usize, depth: usize) -> Result<(Vec<u8>, 
     };
 
     Ok((result, pos))
-}
-
-fn advance_past_fixup(
-    body: &[u8],
-    mut pos: usize,
-    thread_table: &ThreadTable,
-) -> Result<usize> {
-    if pos >= body.len() {
-        return Err(Error("truncated FIXUPP fix_dat"));
-    }
-    let fix_dat = body[pos];
-    pos += 1;
-
-    let _frame = resolve_frame_from_fixdat(body, &mut pos, fix_dat, thread_table)?;
-    let target = resolve_target_from_fixdat(body, &mut pos, fix_dat, thread_table)?;
-
-    if target.method <= 2 {
-        if pos + 2 > body.len() {
-            return Err(Error("truncated FIXUPP displacement"));
-        }
-        pos += 2;
-    }
-
-    Ok(pos)
 }
 
 impl<'data, R: ReadRef<'data>> read::private::Sealed for OmfFile<'data, R> {}

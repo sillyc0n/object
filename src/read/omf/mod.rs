@@ -139,6 +139,8 @@ pub struct ParsedSegment<'data> {
     /// 1-based ordinal as this segment appeared in the file (first SEGDEF = 1).
     #[allow(dead_code)]
     pub ordinal: u16,
+    /// True if this segment is absolute (ACBP A field == 0).
+    pub is_absolute: bool,
     /// Base address in the flat layout (computed after scan, not from the file).
     pub flat_base: u64,
     /// Phantom data for lifetime.

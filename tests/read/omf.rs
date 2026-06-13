@@ -241,10 +241,11 @@ fn omf_thread_persistence() {
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
     data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
     data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
-    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00]));
+    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00])); // EXTDEF BEFORE LEDATA
     data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
     // FIXUPP 1: Define TARGET thread 0
     data.extend(make_record(0x9C, &[0x08, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])); // LEDATA 2
     // FIXUPP 2: Reference TARGET thread 0
     data.extend(make_record(0x9C, &[0x84, 0x00, 0x48, 0x00, 0x00]));
     data.extend(make_record(0x8A, &[0x01]));
@@ -260,7 +261,7 @@ fn omf_thread_overwrite() {
     data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
     data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
     data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00, 0x04, b'g', b'e', b't', b's', 0x00]));
-    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])); // LEDATA
     // FIXUPP body:
     // 1. TARGET thread 0 = ext 1 (puts)
     // 2. TARGET thread 0 = ext 2 (gets)
@@ -353,8 +354,8 @@ fn omf_encounter_order() {
 fn omf_typdef_structural() {
     let mut data = Vec::new();
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
-    // TYPDEF body: name="int", index=1; name="", index=2
-    data.extend(make_record(0x8E, &[0x03, b'i', b'n', b't', 0x01, 0x00, 0x02]));
+    // TYPDEF body: name field (null), eight-leaf descriptor (tag 0x62 (NEAR), type 0x77, length 32)
+    data.extend(make_record(0x8E, &[0x00, 0x62, 0x77, 32])); 
     data.extend(make_record(0x8A, &[0x01]));
     let obj = OmfFile::parse(&data[..]).unwrap();
     assert_eq!(obj.module_name(), b"HELLO");
@@ -411,14 +412,16 @@ fn omf_extdef_ordinals_ignore_comdef() {
 }
 
 #[test]
-fn omf_grpdef_rejects_non_ff_component() {
+fn omf_grpdef_accepts_non_ff_component() {
     let mut data = Vec::new();
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    // Two segments
     data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E', 0x05, b'G', b'R', b'O', b'U', b'P']));
-    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
-    data.extend(make_record(0x9A, &[0x02, 0xFE, 0x01])); // bad component marker
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01])); // Seg 1
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01])); // Seg 2
+    data.extend(make_record(0x9A, &[0x02, 0xFE, 0x01, 0xFE, 0x02])); // Relaxed: non-0xFF components accepted
     data.extend(make_record(0x8A, &[0x01]));
-    assert!(OmfFile::parse(&data[..]).is_err());
+    assert!(OmfFile::parse(&data[..]).is_ok());
 }
 
 #[test]
@@ -453,4 +456,98 @@ fn omf_modend_rejects_trailing_bytes() {
     data.extend(make_record(0x8A, &[0xC1, 0x40, 0x01, 0x23, 0x01, 0xBB]));
     let result = OmfFile::parse(&data[..]);
     assert!(result.is_err());
+}
+
+#[test]
+fn omf_target_thread_rejects_methods_4_5_6() {
+    for method in [4u8, 5, 6] {
+        let mut data = Vec::new();
+        data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+        data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+        data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+        data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00]));
+        data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+
+        // THREAD TARGET subrecord:
+        // bit7=0, D=0 (TARGET), method in bits 4..2, thread number 0.
+        // Methods 4/5/6 do not carry a datum.
+        let thread_b0 = method << 2;
+        data.extend(make_record(0x9C, &[thread_b0]));
+
+        data.extend(make_record(0x8A, &[0x01]));
+
+        let result = OmfFile::parse(&data[..]);
+        assert!(result.is_err(), "TARGET thread method {} should be rejected", method);
+    }
+}
+
+#[test]
+fn omf_thread_target_reused() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x8C, &[0x03, b'f', b'o', b'o', 0x01]));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00])); // LEDATA for SEG 1
+    data.extend(make_record(0x9C, &[
+        0x08, 0x01, // THREAD (TARGET 0, method 2, datum 1)
+        0xC1, 0x00, // locat 0xC100
+        0x08,       // fix_dat (F=0, T=1, explicit frame 0, threaded target 0)
+        0x01,       // datum for explicit frame method 0
+        0x00, 0x00, // displacement for method 2
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    let relocs = sec.relocations().collect::<Vec<_>>();
+    assert_eq!(relocs.len(), 1);
+    match relocs[0].1.target() {
+        RelocationTarget::Symbol(idx) => {
+            assert_eq!(obj.symbol_by_index(idx).unwrap().name().unwrap(), "foo");
+        }
+        _ => panic!("Expected symbol target"),
+    }
+}
+
+#[test]
+fn omf_thread_frame_reused() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00])); // LEDATA for SEG 1
+    data.extend(make_record(0x9C, &[
+        0x40, 0x01, // THREAD (FRAME 0, method 0, datum 1)
+        0xC1, 0x00, // locat 0xC100
+        0x80,       // fix_dat (F=1, frame 0, explicit target (T=0, method 0, datum 1))
+        0x01,       // datum for explicit target method 0
+        0x00, 0x00, // displacement for method 0
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    let relocs = sec.relocations().collect::<Vec<_>>();
+    assert_eq!(relocs.len(), 1);
+}
+
+#[test]
+fn omf_thread_undefined_target() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])); // LEDATA
+    data.extend(make_record(0x9C, &[
+        0xC1, 0x00, // locat
+        0x08,       // F=0, T=1, explicit frame 0, threaded target 0 (undefined)
+        0x01,       // datum for explicit frame method 0
+        0x00, 0x00, // displacement for method 2
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+
+    let result = OmfFile::parse(&data[..]);
+    assert!(result.is_err());
+    assert_eq!(result.err().unwrap().to_string(), "FIXUPP references undefined TARGET thread");
 }
