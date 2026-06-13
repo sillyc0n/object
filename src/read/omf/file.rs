@@ -98,38 +98,65 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
             match record_type {
                 omf::RT_THEADR => {
+                    if prev_was_data_record {
+                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
+                    }
                     self.parse_theadr(record_body)?;
                     prev_was_data_record = false;
                 }
                 omf::RT_LNAMES => {
+                    if prev_was_data_record {
+                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
+                    }
                     self.parse_lnames(record_body)?;
                     prev_was_data_record = false;
                 }
                 omf::RT_SEGDEF => {
+                    if prev_was_data_record {
+                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
+                    }
                     self.parse_segdef(record_body)?;
                     prev_was_data_record = false;
                 }
                 omf::RT_GRPDEF => {
+                    if prev_was_data_record {
+                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
+                    }
                     self.parse_grpdef(record_body)?;
                     prev_was_data_record = false;
                 }
                 omf::RT_EXTDEF => {
+                    if prev_was_data_record {
+                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
+                    }
                     self.parse_extdef(record_body)?;
                     prev_was_data_record = false;
                 }
                 omf::RT_TYPDEF => {
+                    if prev_was_data_record {
+                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
+                    }
                     self.parse_typdef(record_body)?;
                     prev_was_data_record = false;
                 }
                 omf::RT_PUBDEF => {
+                    if prev_was_data_record {
+                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
+                    }
                     self.parse_pubdef(record_body)?;
                     prev_was_data_record = false;
                 }
                 omf::RT_LINNUM => {
+                    if prev_was_data_record {
+                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
+                    }
                     self.parse_linnum(record_body)?;
                     prev_was_data_record = false;
                 }
                 omf::RT_COMDEF => {
+                    if prev_was_data_record {
+                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
+                    }
                     self.parse_comdef(record_body)?;
                     prev_was_data_record = false;
                 }

@@ -551,3 +551,35 @@ fn omf_thread_undefined_target() {
     assert!(result.is_err());
     assert_eq!(result.err().unwrap().to_string(), "FIXUPP references undefined TARGET thread");
 }
+
+#[test]
+fn omf_ledata_must_be_followed_by_fixupp() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])); // LEDATA
+    // Insert intervening record (e.g., PUBDEF)
+    data.extend(make_record(0x90, &[0x00, 0x01, 0x03, b'f', b'o', b'o', 0x02, 0x00, 0x00]));
+    data.extend(make_record(0x9C, &[0x84, 0x00, 0x48, 0x00, 0x00])); // FIXUPP
+    data.extend(make_record(0x8A, &[0x01]));
+    
+    let result = OmfFile::parse(&data[..]);
+    assert!(result.is_err(), "FIXUPP record MUST immediately follow LEDATA/LIDATA if they have fixups");
+}
+
+#[test]
+fn omf_lidata_must_be_followed_by_fixupp() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA2, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00])); // LIDATA
+    // Insert intervening record (e.g., SEGDEF)
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x9C, &[0x84, 0x00, 0x48, 0x00, 0x00])); // FIXUPP
+    data.extend(make_record(0x8A, &[0x01]));
+    
+    let result = OmfFile::parse(&data[..]);
+    assert!(result.is_err(), "FIXUPP record MUST immediately follow LEDATA/LIDATA if they have fixups");
+}
