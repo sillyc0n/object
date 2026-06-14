@@ -165,8 +165,12 @@ pub struct ParsedSymbol<'data> {
 pub enum ParsedSymbolKind {
     /// PUBDEF: defined and exported from this module.
     Public,
+    /// LPUBDEF: defined but not exported from this module.
+    LocalPublic,
     /// EXTDEF: referenced but defined in another module.
     External,
+    /// LEXTDEF: referenced but defined in another module, not visible outside.
+    LocalExternal,
     /// COMDEF: communal (common) storage; may be merged across modules.
     Communal,
 }

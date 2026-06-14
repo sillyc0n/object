@@ -153,6 +153,22 @@ fn omf_pubdef() {
 }
 
 #[test]
+fn omf_local_pubdef() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x20, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xB6, &[0x00, 0x01, 0x03, b'f', b'o', b'o', 0x02, 0x00, 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sym = obj.symbols().find(|s| s.name() == Ok("foo")).unwrap();
+    assert_eq!(sym.address(), 2);
+    assert_eq!(sym.scope(), object::SymbolScope::Compilation);
+    assert!(sym.is_local());
+    assert!(!sym.is_global());
+}
+
+#[test]
 fn omf_extdef() {
     let mut data = Vec::new();
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
@@ -161,6 +177,66 @@ fn omf_extdef() {
     let obj = OmfFile::parse(&data[..]).unwrap();
     let sym = obj.symbols().next().unwrap();
     assert_eq!(sym.name(), Ok("puts"));
+}
+
+#[test]
+fn omf_local_extdef() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0xB4, &[0x04, b'p', b'u', b't', b's', 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sym = obj.symbols().next().unwrap();
+    assert_eq!(sym.name(), Ok("puts"));
+    assert_eq!(sym.scope(), object::SymbolScope::Compilation);
+    assert!(sym.is_local());
+    assert!(!sym.is_global());
+}
+
+#[test]
+fn omf_32bit_ignored() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    // B5H (LEXTDEF 32-bit) - should be ignored
+    data.extend(make_record(0xB5, &[0x04, b'p', b'u', b't', b's', 0x00]));
+    // B7H (LPUBDEF 32-bit) - should be ignored
+    data.extend(make_record(0xB7, &[0x00, 0x01, 0x03, b'f', b'o', b'o', 0x02, 0x00, 0x00, 0x00, 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.symbols().count(), 0);
+}
+
+#[test]
+fn omf_reloc_skip_unresolvable() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00])); // EXTDEF 1
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+    // FIXUPP body:
+    // 1. locat=0x8400, fix_dat=0x42 (frame 4, target=EXT 1 (puts)), disp=0 -> should work
+    // 2. locat=0x8402, fix_dat=0x42 (frame 4, target=EXT 2 (missing)), disp=0 -> should be skipped
+    // 3. locat=0x8404, fix_dat=0x42 (frame 4, target=EXT 1 (puts)), disp=0 -> should work
+    data.extend(make_record(
+        0x9C,
+        &[
+            0x84, 0x00, 0x42, 0x01, 0x00, 0x00, // Reloc 1
+            0x84, 0x02, 0x42, 0x02, 0x00, 0x00, // Reloc 2 (invalid ext 2)
+            0x84, 0x04, 0x42, 0x01, 0x00, 0x00, // Reloc 3
+        ],
+    ));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let mut relocs = obj.sections().next().unwrap().relocations();
+
+    let (off1, _) = relocs.next().unwrap();
+    assert_eq!(off1, 0);
+
+    let (off3, _) = relocs.next().unwrap();
+    assert_eq!(off3, 4);
+
+    assert!(relocs.next().is_none());
 }
 
 #[test]

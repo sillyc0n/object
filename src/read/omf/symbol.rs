@@ -35,7 +35,7 @@ impl<'data, 'file, R: ReadRef<'data>> ObjectSymbol<'data> for OmfSymbol<'data, '
 
     fn address(&self) -> u64 {
         match self.sym.kind {
-            ParsedSymbolKind::Public => {
+            ParsedSymbolKind::Public | ParsedSymbolKind::LocalPublic => {
                 if self.sym.seg_ordinal == 0 {
                     return 0;
                 }
@@ -51,32 +51,38 @@ impl<'data, 'file, R: ReadRef<'data>> ObjectSymbol<'data> for OmfSymbol<'data, '
 
     fn kind(&self) -> SymbolKind {
         match self.sym.kind {
-            ParsedSymbolKind::Public => SymbolKind::Label,
-            ParsedSymbolKind::External => SymbolKind::Unknown,
+            ParsedSymbolKind::Public | ParsedSymbolKind::LocalPublic => SymbolKind::Label,
+            ParsedSymbolKind::External | ParsedSymbolKind::LocalExternal => SymbolKind::Unknown,
             ParsedSymbolKind::Communal => SymbolKind::Data,
         }
     }
 
     fn section(&self) -> SymbolSection {
         match self.sym.kind {
-            ParsedSymbolKind::Public => {
+            ParsedSymbolKind::Public | ParsedSymbolKind::LocalPublic => {
                 if self.sym.seg_ordinal == 0 {
                     SymbolSection::Absolute
                 } else {
                     SymbolSection::Section(SectionIndex(self.sym.seg_ordinal as usize - 1))
                 }
             }
-            ParsedSymbolKind::External => SymbolSection::Undefined,
+            ParsedSymbolKind::External | ParsedSymbolKind::LocalExternal => SymbolSection::Undefined,
             ParsedSymbolKind::Communal => SymbolSection::Common,
         }
     }
 
     fn is_undefined(&self) -> bool {
-        self.sym.kind == ParsedSymbolKind::External
+        matches!(
+            self.sym.kind,
+            ParsedSymbolKind::External | ParsedSymbolKind::LocalExternal
+        )
     }
 
     fn is_definition(&self) -> bool {
-        self.sym.kind == ParsedSymbolKind::Public
+        matches!(
+            self.sym.kind,
+            ParsedSymbolKind::Public | ParsedSymbolKind::LocalPublic
+        )
     }
 
     fn is_common(&self) -> bool {
@@ -88,15 +94,28 @@ impl<'data, 'file, R: ReadRef<'data>> ObjectSymbol<'data> for OmfSymbol<'data, '
     }
 
     fn is_global(&self) -> bool {
-        true
+        matches!(
+            self.sym.kind,
+            ParsedSymbolKind::Public | ParsedSymbolKind::External | ParsedSymbolKind::Communal
+        )
     }
 
     fn is_local(&self) -> bool {
-        false
+        matches!(
+            self.sym.kind,
+            ParsedSymbolKind::LocalPublic | ParsedSymbolKind::LocalExternal
+        )
     }
 
     fn scope(&self) -> SymbolScope {
-        SymbolScope::Linkage
+        match self.sym.kind {
+            ParsedSymbolKind::Public | ParsedSymbolKind::External | ParsedSymbolKind::Communal => {
+                SymbolScope::Linkage
+            }
+            ParsedSymbolKind::LocalPublic | ParsedSymbolKind::LocalExternal => {
+                SymbolScope::Compilation
+            }
+        }
     }
 
     fn flags(&self) -> SymbolFlags<SectionIndex, SymbolIndex> {

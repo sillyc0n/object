@@ -17,10 +17,14 @@ pub const RT_COMENT: u8 = 0x88;
 pub const RT_MODEND: u8 = 0x8A;
 /// EXTDEF: External Names Definition Record.
 pub const RT_EXTDEF: u8 = 0x8C;
+/// LEXTDEF: Local External Names Definition Record.
+pub const RT_LOCAL_EXTDEF: u8 = 0xB4;
 /// TYPDEF: Type Definition Record.
 pub const RT_TYPDEF: u8 = 0x8E;
 /// PUBDEF: Public Names Definition Record.
 pub const RT_PUBDEF: u8 = 0x90;
+/// LPUBDEF: Local Public Names Definition Record.
+pub const RT_LOCAL_PUBDEF: u8 = 0xB6;
 /// LINNUM: Line Number Record.
 pub const RT_LINNUM: u8 = 0x94;
 /// LNAMES: List of Names Record.

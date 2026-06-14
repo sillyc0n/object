@@ -125,11 +125,12 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     self.parse_grpdef(record_body)?;
                     prev_was_data_record = false;
                 }
-                omf::RT_EXTDEF => {
+                omf::RT_EXTDEF | omf::RT_LOCAL_EXTDEF => {
                     if prev_was_data_record {
                         return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
                     }
-                    self.parse_extdef(record_body)?;
+                    let is_local = record_type == omf::RT_LOCAL_EXTDEF;
+                    self.parse_extdef(record_body, is_local)?;
                     prev_was_data_record = false;
                 }
                 omf::RT_TYPDEF => {
@@ -139,11 +140,12 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     self.parse_typdef(record_body)?;
                     prev_was_data_record = false;
                 }
-                omf::RT_PUBDEF => {
+                omf::RT_PUBDEF | omf::RT_LOCAL_PUBDEF => {
                     if prev_was_data_record {
                         return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
                     }
-                    self.parse_pubdef(record_body)?;
+                    let is_local = record_type == omf::RT_LOCAL_PUBDEF;
+                    self.parse_pubdef(record_body, is_local)?;
                     prev_was_data_record = false;
                 }
                 omf::RT_LINNUM => {
@@ -194,6 +196,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     prev_was_data_record = false;
                 }
                 _ => {
+                    // B5H / B7H (32-bit LEXTDEF / LPUBDEF) and other unknown records
+                    // are silently skipped. 32-bit OMF variants are out of scope for
+                    // this OMF16 parser.
                     prev_was_data_record = false;
                 }
             }
@@ -375,7 +380,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         Ok(())
     }
 
-    fn parse_extdef(&mut self, body: &'data [u8]) -> Result<()> {
+    fn parse_extdef(&mut self, body: &'data [u8], is_local: bool) -> Result<()> {
         let mut pos = 0;
         while pos < body.len() {
             let (name, c) = omf::read_name(body, pos).read_error("truncated EXTDEF name")?;
@@ -390,7 +395,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             let sym_index = SymbolIndex(self.symbols.len());
             self.symbols.push(ParsedSymbol {
                 name,
-                kind: ParsedSymbolKind::External,
+                kind: if is_local {
+                    ParsedSymbolKind::LocalExternal
+                } else {
+                    ParsedSymbolKind::External
+                },
                 seg_ordinal: 0,
                 offset: 0,
             });
@@ -453,7 +462,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         Ok(())
     }
 
-    fn parse_pubdef(&mut self, body: &'data [u8]) -> Result<()> {
+    fn parse_pubdef(&mut self, body: &'data [u8], is_local: bool) -> Result<()> {
         let mut pos = 0;
         let (group_idx, c) = omf::read_index(body, pos).read_error("truncated PUBDEF group")?;
         pos += c;
@@ -481,7 +490,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
             self.symbols.push(ParsedSymbol {
                 name,
-                kind: ParsedSymbolKind::Public,
+                kind: if is_local {
+                    ParsedSymbolKind::LocalPublic
+                } else {
+                    ParsedSymbolKind::Public
+                },
                 seg_ordinal: seg_idx,
                 offset: pub_offset,
             });
