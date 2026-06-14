@@ -10,6 +10,16 @@ use crate::ReadRef;
 
 use super::*;
 
+fn omf_class_to_section_kind(class: &[u8]) -> SectionKind {
+    match class {
+        b"CODE" | b"FAR_CODE" => SectionKind::Text,
+        b"DATA" | b"FAR_DATA" => SectionKind::Data,
+        b"BSS" => SectionKind::UninitializedData,
+        b"STACK" => SectionKind::Data,
+        _ => SectionKind::Unknown,
+    }
+}
+
 /// A section of an OMF file.
 #[derive(Debug, Clone, Copy)]
 pub struct OmfSection<'data, 'file, R: ReadRef<'data> = &'data [u8]> {
@@ -99,17 +109,12 @@ impl<'data, 'file, R: ReadRef<'data>> ObjectSection<'data> for OmfSection<'data,
     }
 
     fn kind(&self) -> SectionKind {
-        if self.seg.class_idx == u16::MAX {
-            return SectionKind::Unknown;
-        }
-        let class = self.file.lnames.get(self.seg.class_idx as usize).copied().unwrap_or(b"");
-        match class {
-            b"CODE" | b"FAR_CODE" => SectionKind::Text,
-            b"DATA" | b"FAR_DATA" => SectionKind::Data,
-            b"BSS" => SectionKind::UninitializedData,
-            b"STACK" => SectionKind::Data,
-            _ => SectionKind::Unknown,
-        }
+        let class = if self.seg.class_idx == u16::MAX {
+            b"".as_slice()
+        } else {
+            self.file.lnames.get(self.seg.class_idx as usize).copied().unwrap_or(b"")
+        };
+        omf_class_to_section_kind(class)
     }
 
     fn relocations(&self) -> Self::RelocationIterator {
@@ -214,7 +219,15 @@ impl<'data, 'file, R: ReadRef<'data>> ObjectSegment<'data> for OmfSegment<'data,
     }
 
     fn permissions(&self) -> Permissions {
-        Permissions::new(true, true, false)
+        let class = if self.seg.class_idx == u16::MAX {
+            b"".as_slice()
+        } else {
+            self.file.lnames.get(self.seg.class_idx as usize).copied().unwrap_or(b"")
+        };
+        match omf_class_to_section_kind(class) {
+            SectionKind::Text => Permissions::new(true, false, true),  // R-X
+            _ => Permissions::new(true, true, false),                   // RW-
+        }
     }
 }
 

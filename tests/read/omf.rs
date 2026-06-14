@@ -1,5 +1,5 @@
 use object::read::omf::OmfFile;
-use object::{Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionIndex, SymbolIndex};
+use object::{Architecture, BinaryFormat, Object, ObjectSection, ObjectSegment, ObjectSymbol, Permissions, RelocationTarget, SectionIndex, SectionKind, SymbolIndex};
 
 fn make_record(rt: u8, body: &[u8]) -> Vec<u8> {
     let mut v = Vec::new();
@@ -61,6 +61,56 @@ fn omf_sections() {
     assert_eq!(obj.sections().count(), 1);
     let sec = obj.section_by_name("_TEXT").unwrap();
     assert_eq!(sec.size(), 17);
+}
+
+#[test]
+fn omf_classification() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    // LNAMES: 1="", 2="CODE", 3="DATA", 4="BSS", 5="_TEXT", 6="_DATA", 7="_BSS", 8="_NONE"
+    data.extend(make_record(0x96, &[
+        0x00, // 1
+        0x04, b'C', b'O', b'D', b'E', // 2
+        0x04, b'D', b'A', b'T', b'A', // 3
+        0x03, b'B', b'S', b'S', // 4
+        0x05, b'_', b'T', b'E', b'X', b'T', // 5
+        0x05, b'_', b'D', b'A', b'T', b'A', // 6
+        0x04, b'_', b'B', b'S', b'S', // 7
+        0x05, b'_', b'N', b'O', b'N', b'E' // 8
+    ]));
+
+    // SEGDEF 1: name="_TEXT" (5), class="CODE" (2), length=0x10
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x05, 0x02, 0x01]));
+    // SEGDEF 2: name="_DATA" (6), class="DATA" (3), length=0x20
+    data.extend(make_record(0x98, &[0x48, 0x20, 0x00, 0x06, 0x03, 0x01]));
+    // SEGDEF 3: name="_BSS" (7), class="BSS" (4), length=0x30
+    data.extend(make_record(0x98, &[0x48, 0x30, 0x00, 0x07, 0x04, 0x01]));
+    // SEGDEF 4: name="_NONE" (8), class=None (0), length=0x40
+    data.extend(make_record(0x98, &[0x48, 0x40, 0x00, 0x08, 0x00, 0x01]));
+
+    data.extend(make_record(0x8A, &[0x01]));
+
+    let obj = OmfFile::parse(&data[..]).unwrap();
+
+    let sec1 = obj.section_by_name("_TEXT").unwrap();
+    assert_eq!(sec1.kind(), SectionKind::Text);
+    let seg1 = obj.segments().find(|s| s.name() == Ok(Some("_TEXT"))).unwrap();
+    assert_eq!(seg1.permissions(), Permissions::new(true, false, true));
+
+    let sec2 = obj.section_by_name("_DATA").unwrap();
+    assert_eq!(sec2.kind(), SectionKind::Data);
+    let seg2 = obj.segments().find(|s| s.name() == Ok(Some("_DATA"))).unwrap();
+    assert_eq!(seg2.permissions(), Permissions::new(true, true, false));
+
+    let sec3 = obj.section_by_name("_BSS").unwrap();
+    assert_eq!(sec3.kind(), SectionKind::UninitializedData);
+    let seg3 = obj.segments().find(|s| s.name() == Ok(Some("_BSS"))).unwrap();
+    assert_eq!(seg3.permissions(), Permissions::new(true, true, false));
+
+    let sec4 = obj.section_by_name("_NONE").unwrap();
+    assert_eq!(sec4.kind(), SectionKind::Unknown);
+    let seg4 = obj.segments().find(|s| s.name() == Ok(Some("_NONE"))).unwrap();
+    assert_eq!(seg4.permissions(), Permissions::new(true, true, false));
 }
 
 #[test]
