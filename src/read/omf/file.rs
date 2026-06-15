@@ -488,6 +488,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             let (_type_idx, c) = omf::read_index(body, pos).read_error("truncated PUBDEF type")?;
             pos += c;
 
+            if is_local && self.extdef_symbol_indices.len() >= 1023 {
+                return Err(Error("EXTDEF count exceeds LINK limit of 1023"));
+            }
+
+            let sym_index = SymbolIndex(self.symbols.len());
             self.symbols.push(ParsedSymbol {
                 name,
                 kind: if is_local {
@@ -498,6 +503,10 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 seg_ordinal: seg_idx,
                 offset: pub_offset,
             });
+
+            if is_local {
+                self.extdef_symbol_indices.push(sym_index);
+            }
         }
 
         Ok(())
@@ -786,15 +795,22 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                         omf::read_varlen(body, pos).read_error("truncated COMDEF element size")?;
                     pos += c;
                 }
+                // TODO - The DST branch returns Err on unknown bytes, but the spec allows an ignored type field.
                 _ => return Err(Error("COMDEF: unknown data segment type byte")),
             }
 
+            if self.extdef_symbol_indices.len() >= 1023 {
+                return Err(Error("EXTDEF count exceeds LINK limit of 1023"));
+            }
+            let sym_index = SymbolIndex(self.symbols.len());
             self.symbols.push(ParsedSymbol {
                 name,
                 kind: ParsedSymbolKind::Communal,
                 seg_ordinal: 0,
                 offset: 0,
             });
+            // COMDEF symbols share the EXTDEF ordinal space.
+            self.extdef_symbol_indices.push(sym_index);
         }
         Ok(())
     }

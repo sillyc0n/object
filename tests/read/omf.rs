@@ -709,3 +709,35 @@ fn omf_lidata_must_be_followed_by_fixupp() {
     let result = OmfFile::parse(&data[..]);
     assert!(result.is_err(), "FIXUPP record MUST immediately follow LEDATA/LIDATA if they have fixups");
 }
+
+#[test]
+fn omf_local_pubdef_relocation() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x20, 0x00, 0x01, 0x01, 0x01]));
+    // LPUBDEF: foo at offset 2
+    data.extend(make_record(0xB6, &[0x00, 0x01, 0x03, b'f', b'o', b'o', 0x02, 0x00, 0x00]));
+    // LEDATA
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00]));
+    // FIXUPP: relocation at offset 0, target is external ordinal 1 (which should be LPUBDEF foo)
+    // LOCAT: 0xC400 (M=1, LOC=1, offset=0)
+    // fix_dat: 0x52 (F=0, frame_method=5, T=0, targt=2)
+    // datum: 1
+    // displacement: 0 (2 bytes)
+    data.extend(make_record(0x9C, &[0xC4, 0x00, 0x52, 0x01, 0x00, 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    let mut relocs = sec.relocations();
+    let (offset, reloc) = relocs.next().expect("should have one relocation");
+    assert_eq!(offset, 0);
+    if let RelocationTarget::Symbol(sym_idx) = reloc.target() {
+        let sym = obj.symbol_by_index(sym_idx).unwrap();
+        assert_eq!(sym.name(), Ok("foo"));
+        assert!(sym.is_local());
+    } else {
+        panic!("relocation target should be a symbol");
+    }
+}
