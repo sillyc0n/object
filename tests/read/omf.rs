@@ -511,16 +511,18 @@ fn omf_invalid_header() {
 }
 
 #[test]
-fn omf_extdef_ordinals_ignore_comdef() {
+fn omf_extdef_ordinals_include_comdef() {
     let mut data = Vec::new();
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
     data.extend(make_record(0x88, &[0x00, 0xA1])); // MS extensions
-    data.extend(make_record(0xB0, &[0x03, b'c', b'o', b'm', 0x00, 0x62, 0x04])); // COMDEF
-    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00])); // EXTDEF #1
+    data.extend(make_record(0xB0, &[0x03, b'c', b'o', b'm', 0x00, 0x62, 0x04])); // COMDEF #1
+    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00])); // EXTDEF #2
     data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
     data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
     data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00]));
-    data.extend(make_record(0x9C, &[0x84, 0x00, 0x42, 0x01, 0x00, 0x00])); // explicit ext #1 + disp 0
+    // explicit ext #2 (puts) + disp 0
+    // datum: 2
+    data.extend(make_record(0x9C, &[0x84, 0x00, 0x42, 0x02, 0x00, 0x00])); 
     data.extend(make_record(0x8A, &[0x01]));
 
     let obj = OmfFile::parse(&data[..]).unwrap();

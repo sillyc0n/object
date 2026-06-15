@@ -62,6 +62,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     fn scan(&mut self, data: &'data [u8]) -> Result<()> {
         let mut pos = 0;
         let mut last_data_seg_ordinal: Option<u16> = None;
+        let mut last_data_seg_offset: u16 = 0;
         // Tracks whether the most recently processed record was LEDATA/LIDATA.
         let mut prev_was_data_record = false;
         // THREAD state persists across successive FIXUPP records for the duration of module scanning.
@@ -163,17 +164,24 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     prev_was_data_record = false;
                 }
                 omf::RT_LEDATA => {
-                    let ord = self.parse_ledata(record_body)?;
+                    let (ord, off) = self.parse_ledata(record_body)?;
                     last_data_seg_ordinal = Some(ord);
+                    last_data_seg_offset = off;
                     prev_was_data_record = true;
                 }
                 omf::RT_LIDATA => {
-                    let ord = self.parse_lidata(record_body)?;
+                    let (ord, off) = self.parse_lidata(record_body)?;
                     last_data_seg_ordinal = Some(ord);
+                    last_data_seg_offset = off;
                     prev_was_data_record = true;
                 }
                 omf::RT_FIXUPP => {
-                    self.parse_fixupp(record_body, last_data_seg_ordinal, &mut thread_table)?;
+                    self.parse_fixupp(
+                        record_body,
+                        last_data_seg_ordinal,
+                        last_data_seg_offset,
+                        &mut thread_table,
+                    )?;
                     // A FIXUPP record consumes the "immediately follows" slot;
                     // anything after it (until the next LEDATA/LIDATA) is no
                     // longer adjacent to data.
@@ -536,7 +544,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         Ok(())
     }
 
-    fn parse_ledata(&mut self, body: &[u8]) -> Result<u16> {
+    fn parse_ledata(&mut self, body: &[u8]) -> Result<(u16, u16)> {
         let (seg_idx, c) = omf::read_index(body, 0).read_error("truncated LEDATA segment")?;
         if seg_idx == 0 || seg_idx as usize > self.segments.len() {
             return Err(Error("LEDATA segment index out of range"));
@@ -565,10 +573,10 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         }
         seg.data[data_offset..required].copy_from_slice(data_bytes);
 
-        Ok(seg_idx)
+        Ok((seg_idx, data_offset as u16))
     }
 
-    fn parse_lidata(&mut self, body: &[u8]) -> Result<u16> {
+    fn parse_lidata(&mut self, body: &[u8]) -> Result<(u16, u16)> {
         let (seg_idx, c) = omf::read_index(body, 0).read_error("truncated LIDATA segment")?;
         if seg_idx == 0 || seg_idx as usize > self.segments.len() {
             return Err(Error("LIDATA segment index out of range"));
@@ -597,13 +605,14 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         }
         seg.data[data_offset..required].copy_from_slice(&expanded);
 
-        Ok(seg_idx)
+        Ok((seg_idx, data_offset as u16))
     }
 
     fn parse_fixupp(
         &mut self,
         body: &[u8],
         last_seg_ordinal: Option<u16>,
+        ledata_offset: u16,
         thread_table: &mut ThreadTable,
     ) -> Result<()> {
         let mut pos = 0;
@@ -655,7 +664,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 pos = sub_pos;
 
                 subrecords.push(ParsedFixuppSubrecord::Fixup(ParsedFixupSubrecord {
-                    record_offset: rec_offset,
+                    record_offset: ledata_offset + rec_offset,
                     loc_raw,
                     loc,
                     is_seg_rel,
@@ -680,7 +689,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                         last_seg_ordinal.ok_or(Error("FIXUPP with no preceding data record"))?;
                     let seg = &mut self.segments[seg_ordinal as usize - 1];
                     seg.relocs.push(ParsedReloc {
-                        offset: rec_offset,
+                        offset: ledata_offset + rec_offset,
                         loc,
                         is_seg_rel,
                         target: reloc_target,
@@ -799,9 +808,6 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 _ => return Err(Error("COMDEF: unknown data segment type byte")),
             }
 
-            if self.extdef_symbol_indices.len() >= 1023 {
-                return Err(Error("EXTDEF count exceeds LINK limit of 1023"));
-            }
             let sym_index = SymbolIndex(self.symbols.len());
             self.symbols.push(ParsedSymbol {
                 name,
@@ -809,6 +815,10 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 seg_ordinal: 0,
                 offset: 0,
             });
+
+            if self.extdef_symbol_indices.len() >= 1023 {
+                return Err(Error("EXTDEF count exceeds LINK limit of 1023"));
+            }
             // COMDEF symbols share the EXTDEF ordinal space.
             self.extdef_symbol_indices.push(sym_index);
         }
