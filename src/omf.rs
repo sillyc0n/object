@@ -35,6 +35,8 @@ pub const RT_SEGDEF: u8 = 0x98;
 pub const RT_GRPDEF: u8 = 0x9A;
 /// FIXUPP: Fixup Record.
 pub const RT_FIXUPP: u8 = 0x9C;
+/// FIXUPP32: 32-bit Fixup Record.
+pub const RT_FIXUPP32: u8 = 0x9D;
 /// LEDATA: Logical Enumerated Data Record.
 pub const RT_LEDATA: u8 = 0xA0;
 /// LIDATA: Logical Iterated Data Record.
@@ -72,6 +74,8 @@ pub const ALIGN_WORD: u8 = 2; // relocatable, 2-byte boundary
 pub const ALIGN_PARA: u8 = 3; // relocatable, 16-byte boundary
 /// A-field values (alignment): page aligned (256 bytes).
 pub const ALIGN_PAGE: u8 = 4; // relocatable, 256-byte boundary
+/// A-field values (alignment): dword aligned (4 bytes).
+pub const ALIGN_DWORD: u8 = 5; // relocatable, 4-byte boundary
 
 /// C-field values (combine type): cannot be combined.
 pub const COMBINE_PRIVATE: u8 = 0; // cannot be combined
@@ -101,7 +105,7 @@ pub const LOCAT_FIXUP_MARKER: u16 = 0x8000;
 /// LOCAT M-bit (segment-relative).
 pub const LOCAT_M_BIT: u16 = 0x4000;
 /// LOCAT loc field mask.
-pub const LOCAT_LOC_MASK: u16 = 0x1C00;
+pub const LOCAT_LOC_MASK: u16 = 0x3C00;
 /// LOCAT loc field shift.
 pub const LOCAT_LOC_SHIFT: u16 = 10;
 /// LOCAT offset field mask.
@@ -119,6 +123,12 @@ pub const LOC_POINTER: u16 = 3; // 32-bit far pointer (segment:offset)
 pub const LOC_HIGH_BYTE: u16 = 4; // high-order byte — NOT recognized by LINK
 /// loc field values: loader-resolved offset.
 pub const LOC_LOADER_OFFSET: u16 = 5; // loader-resolved offset; treat as LOC_OFFSET
+/// loc field values: 32-bit offset.
+pub const LOC_OFFSET32: u16 = 9;
+/// loc field values: 48-bit pointer (segment:32-bit offset).
+pub const LOC_POINTER48: u16 = 11;
+/// loc field values: 32-bit loader-resolved offset.
+pub const LOC_LOADER_OFFSET32: u16 = 13; // treat as LOC_OFFSET32
 
 // ── FIXUPP fix_dat byte ───────────────────────────────────────────────────
 //

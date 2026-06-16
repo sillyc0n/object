@@ -30,6 +30,8 @@ impl<'data, 'file, R: ReadRef<'data>> Iterator for OmfRelocationIterator<'data, 
                 omf::LOC_POINTER => 32,
                 omf::LOC_HIGH_BYTE => 8,
                 omf::LOC_LOADER_OFFSET => 16,
+                omf::LOC_OFFSET32 => 32,
+                omf::LOC_POINTER48 => 48,
                 _ => 16,
             };
 
@@ -39,9 +41,9 @@ impl<'data, 'file, R: ReadRef<'data>> Iterator for OmfRelocationIterator<'data, 
                 (RelocationKind::Relative, RelocationEncoding::Generic)
             };
 
-            let target = match r.target {
+            let (target, addend) = match r.target {
                 RelocTarget::Segment(ord) => {
-                    RelocationTarget::Section(SectionIndex(ord as usize - 1))
+                    (RelocationTarget::Section(SectionIndex(ord as usize - 1)), r.displacement as i64)
                 }
                 RelocTarget::Group(ord) => {
                     let seg_ord = self
@@ -51,15 +53,20 @@ impl<'data, 'file, R: ReadRef<'data>> Iterator for OmfRelocationIterator<'data, 
                         .and_then(|g| g.members.first())
                         .copied();
                     match seg_ord {
-                        Some(s) => RelocationTarget::Section(SectionIndex(s as usize - 1)),
+                        Some(s) => (RelocationTarget::Section(SectionIndex(s as usize - 1)), r.displacement as i64),
                         None => continue,
                     }
                 }
                 RelocTarget::External(ord) => {
                     match self.file.extdef_symbol_index(ord) {
-                        Ok(sym) => RelocationTarget::Symbol(sym),
+                        Ok(sym) => (RelocationTarget::Symbol(sym), r.displacement as i64),
                         Err(_) => continue,
                     }
+                }
+                RelocTarget::AbsoluteFrame(frame) => {
+                    // The effective address is (frame << 4) + displacement.
+                    let addr = ((frame as i64) << 4) + r.displacement as i64;
+                    (RelocationTarget::Absolute, addr)
                 }
             };
 
@@ -71,7 +78,7 @@ impl<'data, 'file, R: ReadRef<'data>> Iterator for OmfRelocationIterator<'data, 
                     size,
                     target,
                     subtractor: None,
-                    addend: r.displacement as i64,
+                    addend,
                     implicit_addend: true,
                     flags: RelocationFlags::Generic {
                         kind,

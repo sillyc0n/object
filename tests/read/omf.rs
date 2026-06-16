@@ -1,5 +1,5 @@
-use object::read::omf::OmfFile;
-use object::{Architecture, BinaryFormat, Object, ObjectSection, ObjectSegment, ObjectSymbol, Permissions, RelocationTarget, SectionIndex, SectionKind, SymbolIndex};
+use object::read::omf::{OmfFile, ThreadKind};
+use object::{Architecture, BinaryFormat, Object, ObjectComdat, ObjectSection, ObjectSegment, ObjectSymbol, Permissions, RelocationTarget, SectionIndex, SectionKind, SymbolIndex};
 
 fn make_record(rt: u8, body: &[u8]) -> Vec<u8> {
     let mut v = Vec::new();
@@ -140,6 +140,169 @@ fn omf_lidata() {
 }
 
 #[test]
+fn omf_lidata_flat() {
+    // Flat (block_count=0) LIDATA: repeat 3 times, bytes "XY".
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA2, &[0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, b'X', b'Y']));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(&sec.data().unwrap()[0..6], b"XYXYXY");
+}
+
+#[test]
+fn omf_lidata_nested_two_siblings() {
+    // Nested LIDATA with two sibling sub-blocks.
+    // Top-level: repeat=1, block_count=2
+    //   Sub-block 1: repeat=2, byte 'A' → "AA"
+    //   Sub-block 2: repeat=3, byte 'B' → "BBB"
+    //   Inner concat = "AA" + "BBB" = "AABBB"
+    //   Top repeat = 1 → "AABBB"
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA2, &[
+        0x01,       // seg_idx
+        0x00, 0x00, // data_offset
+        // block_data:
+        0x01, 0x00, // repeat=1
+        0x02, 0x00, // block_count=2
+        // sub-block 1: repeat=2, flat, byte 'A'
+        0x02, 0x00, // repeat=2
+        0x00, 0x00, // block_count=0
+        0x01,        // byte_count=1
+        b'A',
+        // sub-block 2: repeat=3, flat, byte 'B'
+        0x03, 0x00, // repeat=3
+        0x00, 0x00, // block_count=0
+        0x01,        // byte_count=1
+        b'B',
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(&sec.data().unwrap()[0..5], b"AABBB");
+}
+
+#[test]
+fn omf_lidata_nested_repeat_inner() {
+    // Top-level: repeat=3, block_count=2
+    //   Sub-block 1: repeat=2, flat, byte 'A'  → "AA"
+    //   Sub-block 2: repeat=1, flat, byte 'B'  → "B"
+    //   Inner concat = "AA" + "B" = "AAB"
+    //   Top repeat = 3 → "AAB" * 3 = "AABAABAAB"
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x14, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA2, &[
+        0x01,       // seg_idx
+        0x00, 0x00, // data_offset
+        // block_data:
+        0x03, 0x00, // repeat=3
+        0x02, 0x00, // block_count=2
+        // sub-block 1: repeat=2, flat, byte 'A'
+        0x02, 0x00, // repeat=2
+        0x00, 0x00, // block_count=0
+        0x01,       // byte_count=1
+        b'A',
+        // sub-block 2: repeat=1, flat, byte 'B'
+        0x01, 0x00, // repeat=1
+        0x00, 0x00, // block_count=0
+        0x01,       // byte_count=1
+        b'B',
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(&sec.data().unwrap()[0..9], b"AABAABAAB");
+}
+
+#[test]
+fn omf_lidata_trailing_bytes_error() {
+    // Nested LIDATA with trailing garbage — must error.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA2, &[
+        0x01,       // seg_idx
+        0x00, 0x00, // data_offset
+        // block_data with trailing garbage:
+        0x01, 0x00, // repeat=1
+        0x01, 0x00, // block_count=1
+        0x02, 0x00, // sub-block: repeat=2
+        0x00, 0x00, // block_count=0
+        0x01,       // byte_count=1
+        b'X',
+        0xDE, 0xAD, // trailing garbage bytes
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let result = OmfFile::parse(&data[..]);
+    let err = result.err().expect("expected error for trailing LIDATA bytes");
+    assert_eq!(err.to_string(), "unexpected trailing bytes in LIDATA");
+}
+
+#[test]
+fn omf_lidata_truncated_nested_sibling() {
+    // Nested LIDATA where the second sibling is truncated mid-header.
+    // Should error with "truncated LIDATA block", not succeed partially.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA2, &[
+        0x01,       // seg_idx
+        0x00, 0x00, // data_offset
+        // block_data:
+        0x01, 0x00, // repeat=1
+        0x02, 0x00, // block_count=2
+        // sub-block 1: complete, flat, byte 'A'
+        0x01, 0x00, // repeat=1
+        0x00, 0x00, // block_count=0
+        0x01,       // byte_count=1
+        b'A',
+        // sub-block 2: truncated — repeat_count present but no block_count
+        0x01, 0x00, // repeat=1
+        // missing block_count + content
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let result = OmfFile::parse(&data[..]);
+    let err = result.err().expect("expected error for truncated sibling");
+    assert_eq!(err.to_string(), "truncated LIDATA block");
+}
+
+#[test]
+fn omf_lidata_zero_repeat() {
+    // repeat=0 should yield empty output and consume the full block.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA2, &[
+        0x01,       // seg_idx
+        0x00, 0x00, // data_offset
+        0x00, 0x00, // repeat=0
+        0x00, 0x00, // block_count=0 (flat)
+        0x02,       // byte_count=2
+        b'A', b'B',
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    let data = sec.data().unwrap();
+    // Segment is padded to SEGDEF length 0x10. Zero-repeat should leave
+    // the buffer entirely zero-filled (no "AB" written at offset 0).
+    assert_eq!(data.len(), 0x10);
+    assert_eq!(&data[0..2], &[0, 0]);
+    assert!(data.iter().all(|&b| b == 0));
+}
+
+#[test]
 fn omf_pubdef() {
     let mut data = Vec::new();
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
@@ -272,6 +435,50 @@ fn omf_fixupp() {
 }
 
 #[test]
+fn omf_fixupp32() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+    // FIXUPP32 body:
+    // 1. locat=0xC400, fix_dat=0x40 (frame 4), datum=1 (seg 1), disp=0x12345678 (4 bytes)
+    // 2. locat=0x8402, fix_dat=0x42 (frame 4), datum=1 (ext 1), disp=0 (4 bytes)
+    data.extend(make_record(0x9D, &[0xC4, 0x00, 0x40, 0x01, 0x78, 0x56, 0x34, 0x12, 0x84, 0x02, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let mut relocs = obj.sections().next().unwrap().relocations();
+    let r1 = relocs.next().unwrap().1;
+    assert_eq!(r1.target(), RelocationTarget::Section(SectionIndex(0)));
+    assert_eq!(r1.addend(), 0x12345678);
+    let r2 = relocs.next().unwrap().1;
+    assert_eq!(r2.target(), RelocationTarget::Symbol(SymbolIndex(0)));
+    assert_eq!(r2.addend(), 0);
+}
+
+#[test]
+fn omf_loc32_size() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+    // FIXUPP32 body:
+    // 1. locat=0xE400 (loc=9, offset=0), fix_dat=0x40 (frame 4), datum=1, disp=0
+    // 2. locat=0xEC00 (loc=11, offset=0), fix_dat=0x40 (frame 4), datum=1, disp=0
+    data.extend(make_record(0x9D, &[0xE4, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0xEC, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let mut relocs = obj.sections().next().unwrap().relocations();
+    let r1 = relocs.next().unwrap().1;
+    assert_eq!(r1.size(), 32);
+    let r2 = relocs.next().unwrap().1;
+    assert_eq!(r2.size(), 48);
+}
+
+#[test]
 fn omf_modend_entry() {
     let mut data = Vec::new();
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
@@ -400,7 +607,7 @@ fn omf_thread_overwrite() {
 }
 
 #[test]
-fn omf_loc4_skip_threaded() {
+fn omf_loc4_include() {
     let mut data = Vec::new();
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
     data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
@@ -409,15 +616,22 @@ fn omf_loc4_skip_threaded() {
     data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
     // FIXUPP body:
     // 1. Thread subrecord: TARGET thread 0 = ext 1
-    // 2. loc=4 (skip), fix_dat referencing thread 0
+    // 2. loc=4 (high-byte), fix_dat referencing thread 0 → now included
     // 3. Normal fixup referencing thread 0
     data.extend(make_record(0x9C, &[0x08, 0x01, 0x90, 0x00, 0x48, 0x00, 0x00, 0x84, 0x02, 0x48, 0x00, 0x00]));
     data.extend(make_record(0x8A, &[0x01]));
     let obj = OmfFile::parse(&data[..]).unwrap();
     let mut relocs = obj.sections().next().unwrap().relocations();
-    let (off, r) = relocs.next().unwrap();
-    assert_eq!(off, 2);
-    assert_eq!(r.target(), RelocationTarget::Symbol(SymbolIndex(0)));
+    // First relocation: loc=4 (high-byte, size=8) at offset 0
+    let (off1, r1) = relocs.next().unwrap();
+    assert_eq!(off1, 0);
+    assert_eq!(r1.size(), 8);
+    assert_eq!(r1.target(), RelocationTarget::Symbol(SymbolIndex(0)));
+    // Second relocation: normal loc=1 at offset 2
+    let (off2, r2) = relocs.next().unwrap();
+    assert_eq!(off2, 2);
+    assert_eq!(r2.target(), RelocationTarget::Symbol(SymbolIndex(0)));
+    assert!(relocs.next().is_none());
 }
 
 #[test]
@@ -553,13 +767,22 @@ fn omf_grpdef_accepts_non_ff_component() {
 }
 
 #[test]
-fn omf_modend_external_start_is_error() {
+fn omf_modend_external_entry() {
+    // MODEND with external entry point (method 2, since P-bit must be 0).
+    // end_dat=0x02: F=0, frame=0, T=0, P=0, targt=2 → target method 2 (external)
     let mut data = Vec::new();
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
     data.extend(make_record(0x8C, &[0x04, b'm', b'a', b'i', b'n', 0x00]));
-    // module_type = START|RELOC, end_dat = explicit frame method 0 + target method 6
-    data.extend(make_record(0x8A, &[0xC1, 0x06, 0x01, 0x01]));
-    assert!(OmfFile::parse(&data[..]).is_err());
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // module_type=0xC1 (START|RELOC),
+    // end_dat=0x02 (frame meth 0, target meth 2 external, P=0),
+    // frame_datum=0x01 (seg ordinal 1), target_datum=0x01 (ext ordinal 1 = "main"),
+    // displacement=0x0100
+    data.extend(make_record(0x8A, &[0xC1, 0x02, 0x01, 0x01, 0x00, 0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    // External entry: cannot resolve address from object file, returns 0.
+    assert_eq!(obj.entry(), 0);
 }
 
 #[test]
@@ -598,9 +821,9 @@ fn omf_target_thread_accepts_methods_4_5_6() {
 
         // THREAD TARGET subrecord:
         // bit7=0, D=0 (TARGET), method in bits 4..2, thread number 0.
-        // Methods 4/5/6 do not carry a datum.
+        // Methods 4/5/6 carry a datum index.
         let thread_b0 = method << 2;
-        data.extend(make_record(0x9C, &[thread_b0]));
+        data.extend(make_record(0x9C, &[thread_b0, 0x01]));
 
         data.extend(make_record(0x8A, &[0x01]));
 
@@ -742,4 +965,212 @@ fn omf_local_pubdef_relocation() {
     } else {
         panic!("relocation target should be a symbol");
     }
+}
+
+// ── New tests for full FIXUP variant support ──────────────────────────────
+
+#[test]
+fn omf_frame_method_3_accepted() {
+    // FRAME method 3 (explicit frame number) must be accepted.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x00, 0x04, b'C', b'O', b'D', b'E', 0x00])); // lnames: "", "CODE", ""
+    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00])); // EXTDEF #1
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x02, 0x02, 0x01])); // seg name="CODE" (idx 2)
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00]));
+    // FIXUPP body: FRAME method 3 explicit
+    // fix_dat bits: F=0 (explicit), frame=3 (method 3), T=0, P=0, targt=2
+    // fix_dat = 0b0011_0010 = 0x32
+    // locat=0x8400 (M=0, LOC=1, offset=0)
+    // frame_datum=0x10 (frame number = 0x10)
+    // target_method=2 (external), target_datum=0x01 → ext ordinal 1
+    // displacement=0x0000
+    data.extend(make_record(0x9C, &[
+        0x84, 0x00, 0x32, 0x10, 0x01, 0x00, 0x00,
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let result = OmfFile::parse(&data[..]);
+    assert!(result.is_ok(), "FRAME method 3 should be accepted: {:?}", result.err());
+}
+
+#[test]
+fn omf_target_method_3_accepted() {
+    // TARGET method 3 (explicit frame number) must be accepted.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00]));
+    // FIXUPP body:
+    // locat=0x8400 (M=0, LOC=1, offset=0)
+    // fix_dat=0x43 (F=0, frame_method=4, T=0, targt=3)
+    // datum=<frame_number for target method 3>
+    // disp=<displacement>
+    // target method 3: (T=0, P=0, targt=3) => method = ((0) << 2) | 3 = 3
+    // fix_dat = 0x40 | 0x03 = 0x43 (frame method 4, target method 3)
+    data.extend(make_record(0x9C, &[
+        0x84, 0x00, 0x43, 0x10, 0x00, 0x00, // frame=4(seg_loc), target meth 3, frame_num=0x10, disp=0
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let result = OmfFile::parse(&data[..]);
+    assert!(result.is_ok(), "TARGET method 3 should be accepted");
+}
+
+#[test]
+fn omf_absolute_frame_relocation() {
+    // TARGET method 3 produces a relocation with target=Absolute and
+    // addend = (frame_num << 4) + displacement.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00]));
+    // frame method 4 (seg containing LOCATION, no datum), target method 3 (frame number)
+    // fix_dat bits: F=0, frame=4, T=0, P=0, targt=3 → 0x43
+    // datum for target meth 3 = frame number = 0x10 (frame base = 0x100)
+    // displacement = 0x0012 (offset within frame)
+    data.extend(make_record(0x9C, &[
+        0x84, 0x00, 0x43, 0x10, 0x12, 0x00, // target method 3, frame=0x10, disp=0x12
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let mut relocs = obj.sections().next().unwrap().relocations();
+    let (_off, reloc) = relocs.next().expect("should have AbsoluteFrame relocation");
+    assert_eq!(reloc.target(), RelocationTarget::Absolute);
+    // addend = (0x10 << 4) + 0x12 = 0x100 + 0x12 = 0x112
+    assert_eq!(reloc.addend(), 0x112);
+}
+
+#[test]
+fn omf_target_method_7_no_displacement() {
+    // TARGET method 7 (no displacement field) produces AbsoluteFrame with addend = frame<<4.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00]));
+    // fix_dat: F=0, frame_method=4, T=0, P=1, targt=3 → 0x47
+    // (P=1, targt=3) => method = (1<<2) | 3 = 7
+    // datum for target meth 7 = frame number = 0x20 (frame base = 0x200)
+    // no displacement field follows (method 7 has no displacement)
+    data.extend(make_record(0x9C, &[
+        0x84, 0x00, 0x47, 0x20, // target method 7, frame=0x20, no disp
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let mut relocs = obj.sections().next().unwrap().relocations();
+    let (_off, reloc) = relocs.next().expect("should have AbsoluteFrame relocation");
+    assert_eq!(reloc.target(), RelocationTarget::Absolute);
+    // addend = (0x20 << 4) + 0 = 0x200
+    assert_eq!(reloc.addend(), 0x200);
+}
+
+#[test]
+fn omf_comdat_communal() {
+    // COMDEF entries should be visible as COMDAT groups.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x88, &[0x00, 0xA1])); // MS extensions
+    data.extend(make_record(0xB0, &[0x03, b'f', b'o', b'o', 0x00, 0x62, 0x04])); // COMDEF foo NEAR(4)
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let mut comdats = obj.comdats();
+    let comdat = comdats.next().expect("should have one COMDAT for foo");
+    assert_eq!(comdat.name(), Ok("foo"));
+    // COMDEF-based COMDATs have Any selection kind and zero sections.
+    assert_eq!(comdat.kind(), object::ComdatKind::Any);
+    assert_eq!(comdat.sections().count(), 0);
+    assert!(comdats.next().is_none());
+}
+
+#[test]
+fn omf_thread_subrecords_api() {
+    // thread_subrecords() collects all THREAD subrecords from all FIXUPP records.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+    // FIXUPP 1: TARGET thread 0 = ext 1, FRAME thread 1 = seg 1
+    data.extend(make_record(0x9C, &[0x08, 0x01, 0x40, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])); // LEDATA 2
+    // FIXUPP 2: TARGET thread 2 = ext 1
+    data.extend(make_record(0x9C, &[0x0A, 0x01]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let threads = obj.thread_subrecords();
+    assert_eq!(threads.len(), 3);
+    // Check first thread: TARGET thread 0
+    assert_eq!(threads[0].kind, ThreadKind::Target);
+    assert_eq!(threads[0].thread_number, 0);
+    assert_eq!(threads[0].method, 2);
+    assert_eq!(threads[0].datum, Some(1));
+    // Check second thread: FRAME thread 0 (method 0, seg index)
+    assert_eq!(threads[1].kind, ThreadKind::Frame);
+    assert_eq!(threads[1].thread_number, 0);
+    assert_eq!(threads[1].method, 0);
+    assert_eq!(threads[1].datum, Some(1));
+    // Check third thread: TARGET thread 2
+    assert_eq!(threads[2].kind, ThreadKind::Target);
+    assert_eq!(threads[2].thread_number, 2);
+    assert_eq!(threads[2].method, 2);
+    assert_eq!(threads[2].datum, Some(1));
+}
+
+#[test]
+fn omf_fixupp_record_thread_table_snapshot() {
+    // Each ParsedFixuppRecord stores a snapshot of the thread table at
+    // the point the record was parsed.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+    // FIXUPP 1: TARGET thread 0 = ext 1 (method 2)
+    data.extend(make_record(0x9C, &[0x08, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])); // LEDATA 2
+    // FIXUPP 2: TARGET thread 0 = ext 2 (method 2), FRAME thread 1 = seg 1 (method 0)
+    data.extend(make_record(0x9C, &[0x08, 0x02, 0x40, 0x01]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let records = obj.fixupp_records();
+    assert_eq!(records.len(), 2);
+    // FIXUPP 1 thread table: should have TARGET[0] = (method 2, datum 1)
+    let tt1 = &records[0].thread_table;
+    assert!(tt1.target[0].is_some());
+    assert_eq!(tt1.target[0].unwrap().method, 2);
+    assert_eq!(tt1.target[0].unwrap().datum, Some(1));
+    // All other threads should be empty in the first record
+    assert!(tt1.target[1].is_none());
+    assert!(tt1.target[2].is_none());
+    assert!(tt1.target[3].is_none());
+    assert!(tt1.frame[0].is_none());
+    // FIXUPP 2 thread table: TARGET[0] should now be (method 2, datum 2)
+    let tt2 = &records[1].thread_table;
+    assert!(tt2.target[0].is_some());
+    assert_eq!(tt2.target[0].unwrap().method, 2);
+    assert_eq!(tt2.target[0].unwrap().datum, Some(2));
+    // FRAME[0] should be set
+    assert!(tt2.frame[0].is_some());
+    assert_eq!(tt2.frame[0].unwrap().method, 0);
+    assert_eq!(tt2.frame[0].unwrap().datum, Some(1));
+    // Others still empty
+    assert!(tt2.frame[1].is_none());
+    assert!(tt2.frame[2].is_none());
+    assert!(tt2.frame[3].is_none());
+}
+
+#[test]
+fn omf_entry_point_enum() {
+    // Verify that entry point is accessible as the EntryPoint enum.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // MODEND body: type=0xC1, end_dat=0x40 (frame meth 0, target meth 0), datum=1 (seg 1), disp=0x0123
+    data.extend(make_record(0x8A, &[0xC1, 0x40, 0x01, 0x23, 0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    // entry() still returns the flat address.
+    assert_eq!(obj.entry(), 0x0123);
 }

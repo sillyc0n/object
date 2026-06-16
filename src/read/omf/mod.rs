@@ -101,7 +101,7 @@ pub struct ParsedFixupSubrecord {
     /// The datum used for the TARGET.
     pub target_datum: u16,
     /// The displacement associated with the TARGET, if any.
-    pub target_displacement: Option<u16>,
+    pub target_displacement: Option<u32>,
 }
 
 /// A decoded FIXUPP record containing multiple subrecords.
@@ -111,6 +111,8 @@ pub struct ParsedFixuppRecord {
     pub attached_seg_ordinal: Option<u16>,
     /// The list of subrecords in encounter order.
     pub subrecords: Vec<ParsedFixuppSubrecord>,
+    /// Snapshot of the thread table at the start of this FIXUPP record.
+    pub thread_table: ThreadTable,
 }
 
 /// One segment, parsed from a SEGDEF record and populated by LEDATA/LIDATA.
@@ -187,7 +189,7 @@ pub struct ParsedReloc {
     /// What the fixup targets.
     pub target: RelocTarget,
     /// Target displacement.
-    pub displacement: u16,
+    pub displacement: u32,
 }
 
 /// The target of an OMF relocation.
@@ -203,6 +205,11 @@ pub enum RelocTarget {
     Group(u16),
     /// An external symbol.
     External(u16),
+    /// An absolute frame number.
+    ///
+    /// The effective absolute address is `(frame_number << 4) + displacement`.
+    /// Used by FIXUPP target methods 3 and 7 (explicit frame number).
+    AbsoluteFrame(u16),
 }
 
 /// One group, parsed from a GRPDEF record.
@@ -213,4 +220,15 @@ pub struct ParsedGroup {
     pub name_idx: u16,
     /// 1-based SEGDEF ordinals of all member segments, in encounter order.
     pub members: Vec<u16>,
+}
+
+/// The entry point kind for a parsed OMF file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryPoint {
+    /// No entry point (module is not main).
+    None,
+    /// Entry point is a segment ordinal + offset.
+    Segment(u16, u16),
+    /// Entry point is an external symbol ordinal + offset.
+    External(u16, u16),
 }

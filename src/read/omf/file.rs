@@ -27,7 +27,10 @@ pub struct OmfFile<'data, R: ReadRef<'data> = &'data [u8]> {
     /// Decoded FIXUPP records for dump purposes.
     pub fixupp_records: Vec<ParsedFixuppRecord>,
     pub(super) extdef_symbol_indices: Vec<SymbolIndex>,
-    pub(super) entry: Option<(u16, u16)>,
+    pub(super) entry: EntryPoint,
+    /// COMDAT groups derived from COMDEF entries.
+    /// Each entry is (SymbolIndex, ComdatKind).
+    pub(super) comdat_groups: Vec<(SymbolIndex, crate::read::ComdatKind)>,
     #[allow(unused)]
     pub(super) has_ms_ext: bool,
     pub(super) marker: PhantomData<&'data ()>,
@@ -48,7 +51,8 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             symbols: Vec::new(),
             fixupp_records: Vec::new(),
             extdef_symbol_indices: Vec::new(),
-            entry: None,
+            entry: EntryPoint::None,
+            comdat_groups: Vec::new(),
             has_ms_ext: false,
             marker: PhantomData,
         };
@@ -175,12 +179,13 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     last_data_seg_offset = off;
                     prev_was_data_record = true;
                 }
-                omf::RT_FIXUPP => {
+                omf::RT_FIXUPP | omf::RT_FIXUPP32 => {
                     self.parse_fixupp(
                         record_body,
                         last_data_seg_ordinal,
                         last_data_seg_offset,
                         &mut thread_table,
+                        record_type == omf::RT_FIXUPP32,
                     )?;
                     // A FIXUPP record consumes the "immediately follows" slot;
                     // anything after it (until the next LEDATA/LIDATA) is no
@@ -205,8 +210,8 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 }
                 _ => {
                     // B5H / B7H (32-bit LEXTDEF / LPUBDEF) and other unknown records
-                    // are silently skipped. 32-bit OMF variants are out of scope for
-                    // this OMF16 parser.
+                    // are silently skipped. Most 32-bit OMF variants are out of scope
+                    // for this OMF16 parser.
                     prev_was_data_record = false;
                 }
             }
@@ -316,6 +321,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             omf::ALIGN_ABSOLUTE => 1u32,
             omf::ALIGN_BYTE => 1,
             omf::ALIGN_WORD => 2,
+            omf::ALIGN_DWORD => 4,
             omf::ALIGN_PARA => 16,
             omf::ALIGN_PAGE => 256,
             _ => return Err(Error("unknown SEGDEF alignment")),
@@ -463,7 +469,12 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                         .read_error("truncated TYPDEF element_type_index")?;
                     pos += c;
                 }
-                _ => return Err(Error("unrecognized TYPDEF leaf descriptor tag")),
+                _ => {
+                    // Unknown leaf descriptor tag — skip remaining leaves in this
+                    // TYPDEF record, as tool-specific descriptors may be present.
+                    // The OMF spec states linkers should ignore unrecognized tags.
+                    break;
+                }
             }
         }
 
@@ -593,7 +604,10 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             return Err(Error("LIDATA iterated data block exceeds 512-byte LINK limit"));
         }
 
-        let (expanded, _) = expand_lidata(block_data, 0, 0)?;
+        let (expanded, consumed) = expand_lidata(block_data, 0, 0)?;
+        if consumed != block_data.len() {
+            return Err(Error("unexpected trailing bytes in LIDATA"));
+        }
 
         let seg = &mut self.segments[seg_idx as usize - 1];
         let required = data_offset + expanded.len();
@@ -614,6 +628,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         last_seg_ordinal: Option<u16>,
         ledata_offset: u16,
         thread_table: &mut ThreadTable,
+        is_32bit: bool,
     ) -> Result<()> {
         let mut pos = 0;
         let mut subrecords = Vec::new();
@@ -638,6 +653,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
                 let loc = match loc_raw as u16 {
                     omf::LOC_LOADER_OFFSET => omf::LOC_OFFSET as u8,
+                    omf::LOC_LOADER_OFFSET32 => omf::LOC_OFFSET32 as u8,
                     other => other as u8,
                 };
 
@@ -655,11 +671,24 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
                 let mut target_displacement = None;
                 if (target.method & 0x04) == 0 {
-                    if sub_pos + 2 > body.len() {
-                        return Err(Error("truncated FIXUPP displacement"));
+                    if is_32bit {
+                        if sub_pos + 4 > body.len() {
+                            return Err(Error("truncated FIXUPP32 displacement"));
+                        }
+                        target_displacement = Some(u32::from_le_bytes([
+                            body[sub_pos],
+                            body[sub_pos + 1],
+                            body[sub_pos + 2],
+                            body[sub_pos + 3],
+                        ]));
+                        sub_pos += 4;
+                    } else {
+                        if sub_pos + 2 > body.len() {
+                            return Err(Error("truncated FIXUPP displacement"));
+                        }
+                        target_displacement = Some(u16::from_le_bytes([body[sub_pos], body[sub_pos + 1]]) as u32);
+                        sub_pos += 2;
                     }
-                    target_displacement = Some(u16::from_le_bytes([body[sub_pos], body[sub_pos + 1]]));
-                    sub_pos += 2;
                 }
                 pos = sub_pos;
 
@@ -678,11 +707,12 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     target_displacement,
                 }));
 
-                if loc != 4 {
+                {
                     let reloc_target = match target.method & 0x03 {
                         0 => RelocTarget::Segment(target.datum.unwrap_or(0)),
                         1 => RelocTarget::Group(target.datum.unwrap_or(0)),
                         2 => RelocTarget::External(target.datum.unwrap_or(0)),
+                        3 => RelocTarget::AbsoluteFrame(target.datum.unwrap_or(0)),
                         _ => continue,
                     };
                     let seg_ordinal =
@@ -702,6 +732,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         self.fixupp_records.push(ParsedFixuppRecord {
             attached_seg_ordinal: last_seg_ordinal,
             subrecords,
+            thread_table: *thread_table,
         });
 
         Ok(())
@@ -714,7 +745,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         let module_type = body[0];
 
         if module_type & omf::MODEND_START == 0 {
-            self.entry = None;
+            self.entry = EntryPoint::None;
             return Ok(());
         }
 
@@ -750,7 +781,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         };
 
         self.entry = match target.method {
-            0 | 4 => Some((target.datum.unwrap_or(0), displacement)),
+            0 | 4 => EntryPoint::Segment(target.datum.unwrap_or(0), displacement),
             1 | 5 => {
                 let grp = self
                     .groups
@@ -761,10 +792,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     .first()
                     .copied()
                     .ok_or(Error("MODEND group has no member segments"))?;
-                Some((seg, displacement))
+                EntryPoint::Segment(seg, displacement)
             }
             2 | 6 => {
-                return Err(Error("MODEND external start address is unsupported"));
+                // External entry point: datum is the EXTDEF ordinal, displacement is the offset.
+                EntryPoint::External(target.datum.unwrap_or(0), displacement)
             }
             _ => {
                 return Err(Error("MODEND target method unsupported"));
@@ -804,8 +836,12 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                         omf::read_varlen(body, pos).read_error("truncated COMDEF element size")?;
                     pos += c;
                 }
-                // TODO - The DST branch returns Err on unknown bytes, but the spec allows an ignored type field.
-                _ => return Err(Error("COMDEF: unknown data segment type byte")),
+                _ => {
+                    // Unknown DST — skip remaining entries in this COMDEF record.
+                    // The spec allows tool-specific DST values that linkers
+                    // should ignore.
+                    break;
+                }
             }
 
             let sym_index = SymbolIndex(self.symbols.len());
@@ -821,6 +857,10 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             }
             // COMDEF symbols share the EXTDEF ordinal space.
             self.extdef_symbol_indices.push(sym_index);
+            // Expose each COMDEF as a COMDAT group with zero sections.
+            // This allows consumers to discover communal variables via the
+            // ObjectComdat trait.
+            self.comdat_groups.push((sym_index, crate::read::ComdatKind::Any));
         }
         Ok(())
     }
@@ -860,6 +900,19 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         &self.fixupp_records
     }
 
+    /// Collect all THREAD subrecords from all FIXUPP records.
+    pub fn thread_subrecords(&self) -> Vec<&ParsedThreadSubrecord> {
+        let mut threads = Vec::new();
+        for rec in &self.fixupp_records {
+            for sub in &rec.subrecords {
+                if let ParsedFixuppSubrecord::Thread(t) = sub {
+                    threads.push(t);
+                }
+            }
+        }
+        threads
+    }
+
     /// Get the module name.
     pub fn module_name(&self) -> &'data [u8] {
         self.module_name
@@ -896,17 +949,20 @@ fn parse_thread_subrecord(
     let valid = if is_frame {
         matches!(method, 0 | 1 | 2 | 4 | 5)
     } else {
-        // TARGET threads store only the base target kind:
-        // 0=segment, 1=group, 2=external.
-        // The consuming fixup's P bit supplies the high method bit later
-        // when reconstructing the effective target method.
+        // TARGET threads store only the base target kind (0, 1, 2) or no-displacement (4, 5, 6).
         matches!(method, 0 | 1 | 2 | 4 | 5 | 6)
     };
     if !valid {
         return Err(Error("invalid THREAD method"));
     }
 
-    let datum = if method <= 2 {
+    let has_datum = if is_frame {
+        method <= 2
+    } else {
+        method <= 2 || matches!(method, 4 | 5 | 6)
+    };
+
+    let datum = if has_datum {
         let (idx, c) = omf::read_index(body, *pos).read_error("truncated THREAD datum")?;
         *pos += c;
         Some(idx)
@@ -948,10 +1004,7 @@ fn resolve_frame_from_fixdat(
 
     if !f_bit {
         let method = frame_f;
-        if method == 3 {
-            return Err(Error("FIXUPP explicit-frame-number frame (method 3) is unsupported"));
-        }
-        let datum = if method <= 2 {
+        let datum = if method <= 2 || method == 3 {
             let (idx, c) = omf::read_index(body, *pos).read_error("truncated fixup frame datum")?;
             *pos += c;
             Some(idx)
@@ -967,9 +1020,6 @@ fn resolve_frame_from_fixdat(
         let thread_num = frame_f as u8;
         let te = thread_table.frame[thread_num as usize]
             .ok_or(Error("FIXUPP references undefined FRAME thread"))?;
-        if te.method == 3 {
-            return Err(Error("FIXUPP explicit-frame-number frame (method 3) is unsupported"));
-        }
         if te.method <= 2 && te.datum.is_none() {
             return Err(Error("FIXUPP frame thread missing datum"));
         }
@@ -999,9 +1049,6 @@ fn resolve_target_from_fixdat(
 
     if !t_bit {
         let method = ((p_bit as u8) << 2) | targt;
-        if matches!(method, 3 | 7) {
-            return Err(Error("FIXUPP explicit-frame-number target (method 3/7) is unsupported"));
-        }
         let (idx, c) = omf::read_index(body, *pos).read_error("truncated fixup target datum")?;
         *pos += c;
         Ok(Some(ResolvedTarget {
@@ -1014,9 +1061,6 @@ fn resolve_target_from_fixdat(
         let te = thread_table.target[thread_num as usize]
             .ok_or(Error("FIXUPP references undefined TARGET thread"))?;
         let method = ((p_bit as u8) << 2) | te.method;
-        if matches!(method, 3 | 7) {
-            return Err(Error("FIXUPP explicit-frame-number target (method 3/7) is unsupported"));
-        }
         let datum = te.datum.ok_or(Error("FIXUPP target thread missing datum"))?;
         Ok(Some(ResolvedTarget {
             method,
@@ -1026,18 +1070,18 @@ fn resolve_target_from_fixdat(
     }
 }
 
-fn expand_lidata(data: &[u8], mut pos: usize, depth: usize) -> Result<(Vec<u8>, usize)> {
+fn expand_lidata(data: &[u8], pos: usize, depth: usize) -> Result<(Vec<u8>, usize)> {
     if depth > 8 {
         return Err(Error("LIDATA nesting too deep"));
     }
     if pos + 4 > data.len() {
         return Err(Error("truncated LIDATA block"));
     }
+    let start_pos = pos;
 
     let repeat_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-    pos += 2;
-    let block_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-    pos += 2;
+    let block_count = u16::from_le_bytes([data[pos + 2], data[pos + 3]]) as usize;
+    let mut pos = pos + 4;
 
     let result = if block_count == 0 {
         if pos >= data.len() {
@@ -1061,7 +1105,7 @@ fn expand_lidata(data: &[u8], mut pos: usize, depth: usize) -> Result<(Vec<u8>, 
         inner.repeat(repeat_count)
     };
 
-    Ok((result, pos))
+    Ok((result, pos - start_pos))
 }
 
 impl<'data, R: ReadRef<'data>> read::private::Sealed for OmfFile<'data, R> {}
@@ -1133,6 +1177,7 @@ impl<'data, R: ReadRef<'data>> Object<'data> for OmfFile<'data, R> {
     fn comdats(&self) -> Self::ComdatIterator<'_> {
         OmfComdatIterator {
             file: self,
+            index: 0,
         }
     }
 
@@ -1195,8 +1240,15 @@ impl<'data, R: ReadRef<'data>> Object<'data> for OmfFile<'data, R> {
 
     fn entry(&self) -> u64 {
         match self.entry {
-            None => 0,
-            Some((seg_ord, offset)) => self.flat_base(seg_ord) + offset as u64,
+            EntryPoint::None => 0,
+            EntryPoint::Segment(seg_ord, offset) => self.flat_base(seg_ord) + offset as u64,
+            EntryPoint::External(ordinal, _offset) => {
+                // External entry: return 0 since we cannot resolve the address
+                // from the object file alone. Consumers may look up the symbol
+                // by ordinal via extdef_symbol_index().
+                let _ = ordinal;
+                0
+            }
         }
     }
 
