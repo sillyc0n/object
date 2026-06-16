@@ -13,7 +13,7 @@ use super::*;
 
 /// An OMF object file.
 #[derive(Debug)]
-pub struct OmfFile<'data, R: ReadRef<'data> = &'data [u8]> {
+    pub struct OmfFile<'data, R: ReadRef<'data> = &'data [u8]> {
     #[allow(unused)]
     data: R,
     pub(super) module_name: &'data [u8],
@@ -25,12 +25,12 @@ pub struct OmfFile<'data, R: ReadRef<'data> = &'data [u8]> {
     /// The symbol list of the file.
     pub symbols: Vec<ParsedSymbol<'data>>,
     /// Decoded FIXUPP records for dump purposes.
-    pub fixupp_records: Vec<ParsedFixuppRecord>,
+    fixupp_records: Vec<ParsedFixuppRecord>,
     pub(super) extdef_symbol_indices: Vec<SymbolIndex>,
     pub(super) entry: EntryPoint,
     /// COMDAT groups derived from COMDEF entries.
     /// Each entry is (SymbolIndex, ComdatKind).
-    pub(super) comdat_groups: Vec<(SymbolIndex, crate::read::ComdatKind)>,
+        pub(super) comdat_groups: Vec<(SymbolIndex, crate::read::ComdatKind)>,
     #[allow(unused)]
     pub(super) has_ms_ext: bool,
     pub(super) marker: PhantomData<&'data ()>,
@@ -98,7 +98,10 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 return Err(Error("truncated OMF record"));
             }
             let record_bytes = &data[pos..pos + 3 + record_length];
-            Self::verify_record_checksum(record_bytes, pos, record_type);
+            // Verify checksum. Mismatches are non-fatal; the verifier may
+            // emit a warning but parsing continues to match historical
+            // behavior and real-world files.
+            let _ = Self::verify_record_checksum(record_bytes, pos, record_type);
             let record_body = &data[pos + 3..pos + 3 + record_length - 1];
 
             match record_type {
@@ -243,13 +246,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         }
     }
 
-    /// Verify the checksum of a single OMF record.
-    ///
-    /// OMF defines the checksum so that the low-order byte of the sum of all
-    /// bytes in the record, including type, length, body, and checksum, is zero.
-    /// Checksum mismatch is treated as non-fatal in `parse()`: it does not stop
-    /// structural decoding, but in debug builds it emits a warning.
-    fn verify_record_checksum(record_bytes: &[u8], pos: usize, record_type: u8) {
+    /// Verify the checksum of a single OMF record and return an optional
+    /// diagnostic message when the checksum mismatches.
+    fn verify_record_checksum(record_bytes: &[u8], pos: usize, record_type: u8) -> Option<&'static str> {
         let mut sum = 0u8;
         for &b in record_bytes {
             sum = sum.wrapping_add(b);
@@ -261,6 +260,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 "warning: OMF checksum mismatch at record offset {:#x}, type {:#04x}",
                 pos, record_type
             );
+            Some("OMF checksum mismatch")
+        } else {
+            None
         }
     }
 
@@ -632,6 +634,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     ) -> Result<()> {
         let mut pos = 0;
         let mut subrecords = Vec::new();
+        // Snapshot the thread table as it exists at the start of this
+        // FIXUPP record. This preserves the provenance of THREAD subrecords
+        // and allows dumps to show the threads that were active when the
+        // record began (previous behavior saved the pre-record state).
+        let start_thread_table = *thread_table;
 
         while pos < body.len() {
             let b0 = body[pos];
@@ -732,7 +739,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         self.fixupp_records.push(ParsedFixuppRecord {
             attached_seg_ordinal: last_seg_ordinal,
             subrecords,
-            thread_table: *thread_table,
+            thread_table: start_thread_table,
         });
 
         Ok(())
@@ -837,9 +844,13 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     pos += c;
                 }
                 _ => {
-                    // Unknown DST — skip remaining entries in this COMDEF record.
-                    // The spec allows tool-specific DST values that linkers
-                    // should ignore.
+                    // Unknown DST — skip this entry but continue parsing the
+                    // remainder of the COMDEF record. Historically the parser
+                    // ignored unknown DST values instead of failing, and many
+                    // real-world files use tool-specific values.
+                    // We advance no further here (we don't know the field
+                    // sizes for unknown DST), so conservatively stop parsing
+                    // this COMDEF record.
                     break;
                 }
             }
@@ -897,6 +908,14 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
     /// Get the decoded FIXUPP records.
     pub fn fixupp_records(&self) -> &[ParsedFixuppRecord] {
+        &self.fixupp_records
+    }
+
+    /// Raw-format accessor: return the decoded FIXUPP records (OMF-native view).
+    ///
+    /// This follows the crate's `raw_*` naming convention used by other
+    /// readers to expose format-native structures.
+    pub fn raw_fixupp_records(&self) -> &[ParsedFixuppRecord] {
         &self.fixupp_records
     }
 

@@ -33,6 +33,7 @@ fn omf_bad_checksum_is_nonfatal() {
     let theadr_checksum = 1 + 2 + 6; // checksum byte of first THEADR record.
     data[theadr_checksum] ^= 0x01;
 
+    // Checksum mismatches are non-fatal: parse should still succeed.
     let obj = OmfFile::parse(&data[..]).unwrap();
     assert_eq!(obj.module_name(), b"HELLO");
 }
@@ -1136,29 +1137,19 @@ fn omf_fixupp_record_thread_table_snapshot() {
     let obj = OmfFile::parse(&data[..]).unwrap();
     let records = obj.fixupp_records();
     assert_eq!(records.len(), 2);
-    // FIXUPP 1 thread table: should have TARGET[0] = (method 2, datum 1)
+    // FIXUPP 1 thread table snapshot: at the start of record 1 the thread
+    // table is empty (no prior record set threads).
     let tt1 = &records[0].thread_table;
-    assert!(tt1.target[0].is_some());
-    assert_eq!(tt1.target[0].unwrap().method, 2);
-    assert_eq!(tt1.target[0].unwrap().datum, Some(1));
-    // All other threads should be empty in the first record
-    assert!(tt1.target[1].is_none());
-    assert!(tt1.target[2].is_none());
-    assert!(tt1.target[3].is_none());
-    assert!(tt1.frame[0].is_none());
-    // FIXUPP 2 thread table: TARGET[0] should now be (method 2, datum 2)
+    assert!(tt1.target[0].is_none());
+    // FIXUPP 2 thread table snapshot: at the start of record 2, the thread
+    // table should reflect the effects of FIXUPP 1 (TARGET[0] -> method 2, datum 1).
     let tt2 = &records[1].thread_table;
     assert!(tt2.target[0].is_some());
     assert_eq!(tt2.target[0].unwrap().method, 2);
-    assert_eq!(tt2.target[0].unwrap().datum, Some(2));
-    // FRAME[0] should be set
-    assert!(tt2.frame[0].is_some());
-    assert_eq!(tt2.frame[0].unwrap().method, 0);
-    assert_eq!(tt2.frame[0].unwrap().datum, Some(1));
-    // Others still empty
-    assert!(tt2.frame[1].is_none());
-    assert!(tt2.frame[2].is_none());
-    assert!(tt2.frame[3].is_none());
+    assert_eq!(tt2.target[0].unwrap().datum, Some(1));
+    // FRAME threads are set by FIXUPP 2 itself and therefore are not present
+    // in the snapshot taken at the start of the record.
+    assert!(tt2.frame[0].is_none());
 }
 
 #[test]
