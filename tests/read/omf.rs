@@ -905,35 +905,47 @@ fn omf_thread_undefined_target() {
 }
 
 #[test]
-fn omf_ledata_must_be_followed_by_fixupp() {
+fn omf_fixupp_with_intervening_records_accepted() {
+    // FIXUPP no longer requires immediate adjacency to LEDATA/LIDATA.
+    // Intervening records are accepted; FIXUPP thread-only bodies (no
+    // fixup subrecords) proceed without error even with no data target.
     let mut data = Vec::new();
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
     data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
     data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00])); // EXTDEF
     data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])); // LEDATA
-    // Insert intervening record (e.g., PUBDEF)
-    data.extend(make_record(0x90, &[0x00, 0x01, 0x03, b'f', b'o', b'o', 0x02, 0x00, 0x00]));
-    data.extend(make_record(0x9C, &[0x84, 0x00, 0x48, 0x00, 0x00])); // FIXUPP
+    // Insert intervening SEGDEF (previously rejected)
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    // FIXUPP with only THREAD subrecord (no fixup, no data target needed)
+    data.extend(make_record(0x9C, &[0x08, 0x01])); // THREAD TARGET[0] = ext 1
     data.extend(make_record(0x8A, &[0x01]));
-    
-    let result = OmfFile::parse(&data[..]);
-    assert!(result.is_err(), "FIXUPP record MUST immediately follow LEDATA/LIDATA if they have fixups");
+
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    // No relocations were produced since the FIXUPP had no fixup subrecords,
+    // but the parse should not error due to intervening records.
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(sec.relocations().count(), 0);
 }
 
 #[test]
-fn omf_lidata_must_be_followed_by_fixupp() {
+fn omf_lidata_with_intervening_records_accepted() {
     let mut data = Vec::new();
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
     data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
     data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
-    data.extend(make_record(0xA2, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00])); // LIDATA
-    // Insert intervening record (e.g., SEGDEF)
+    // Flat LIDATA: repeat=1, block_count=0, byte_count=1, data=0xAA
+    data.extend(make_record(0xA2, &[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xAA]));
+    // Insert intervening SEGDEF (previously rejected with hard error)
     data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
-    data.extend(make_record(0x9C, &[0x84, 0x00, 0x48, 0x00, 0x00])); // FIXUPP
+    // FIXUPP with only THREAD subrecord (no fixup, no data target needed)
+    data.extend(make_record(0x9C, &[0x08, 0x01]));
     data.extend(make_record(0x8A, &[0x01]));
-    
-    let result = OmfFile::parse(&data[..]);
-    assert!(result.is_err(), "FIXUPP record MUST immediately follow LEDATA/LIDATA if they have fixups");
+
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(sec.relocations().count(), 0);
+    assert_eq!(sec.data().unwrap()[0], 0xAA);
 }
 
 #[test]
@@ -966,6 +978,158 @@ fn omf_local_pubdef_relocation() {
     } else {
         panic!("relocation target should be a symbol");
     }
+}
+
+// ── New tests for full 32-bit OMF support ─────────────────────────────────
+
+#[test]
+fn omf_segdef32() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    // SEGDEF32: acbp=0x28, length=0x10000 (u32), name=1, class=1, overlay=1
+    data.extend(make_record(0x99, &[0x28, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01]));
+    // LEDATA for seg 1: offset=0, data=0xAA
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0xAA]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(sec.size(), 0x10000);
+    assert_eq!(sec.data().unwrap()[0], 0xAA);
+}
+
+#[test]
+fn omf_ledata32() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x20, 0x00, 0x01, 0x01, 0x01]));
+    // LEDATA32: seg=1, offset=0x00000010 (u32), data=0xBB
+    data.extend(make_record(0xA1, &[0x01, 0x10, 0x00, 0x00, 0x00, 0xBB]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(sec.data().unwrap()[0x10], 0xBB);
+}
+
+#[test]
+fn omf_modend32() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // MODEND32: type=0xC1, end_dat=0x40, datum=1, disp=0x00000123 (u32)
+    data.extend(make_record(0x8B, &[0xC1, 0x40, 0x01, 0x23, 0x01, 0x00, 0x00]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.entry(), 0x123);
+}
+
+#[test]
+fn omf_coment_as_segdef() {
+    // COMENT record (0x88) with body that structurally matches a SEGDEF
+    // should be accepted as a Borland-variant segment definition.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    // COMENT acting as SEGDEF: acbp=0x28, length=0x10, name=1, class=1, overlay=1
+    data.extend(make_record(0x88, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0xAA]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(sec.size(), 0x10);
+}
+
+#[test]
+fn omf_grpdef_absolute_frame() {
+    // GRPDEF with component type 0xFA (absolute frame).
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x05, b'G', b'R', b'O', b'U', b'P']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // GRPDEF: name=1, component type 0xFA (frame=0x10, offset=0x1234)
+    data.extend(make_record(0x9A, &[0x01, 0xFA, 0x10, 0x00, 0x34, 0x12]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.groups.len(), 1);
+}
+
+#[test]
+fn omf_grpdef_ltl() {
+    // GRPDEF with component type 0xFB (LTL).
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x05, b'G', b'R', b'O', b'U', b'P']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // GRPDEF: name=1, component type 0xFB (ltl_data=0, max_length=0x10, length=0x08)
+    data.extend(make_record(0x9A, &[0x01, 0xFB, 0x00, 0x10, 0x00, 0x08, 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.groups.len(), 1);
+}
+
+#[test]
+fn omf_grpdef_name_triple() {
+    // GRPDEF with component type 0xFD (name triple).
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x05, b'G', b'R', b'O', b'U', b'P']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // GRPDEF: name=1, component type 0xFD (seg_name=1, class_name=2, overlay=3)
+    data.extend(make_record(0x9A, &[0x01, 0xFD, 0x01, 0x02, 0x03]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.groups.len(), 1);
+}
+
+#[test]
+fn omf_grpdef_unresolved() {
+    // GRPDEF referencing a segment ordinal that does not yet exist.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x05, b'G', b'R', b'O', b'U', b'P']));
+    // GRPDEF: name=1, component type 0xFF targeting seg=5 (not defined yet)
+    data.extend(make_record(0x9A, &[0x01, 0xFF, 0x05]));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.groups.len(), 1);
+    // The unresolved member should still appear in resolved_members as None.
+    assert!(obj.groups[0].resolved_members[0].is_none());
+}
+
+#[test]
+fn omf_bss_segment() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x03, b'B', b'S', b'S']));
+    // BSS segment: A=1 (BYTE), C=2 (PUBLIC), B=1 (big/default 64KB), P=0
+    // ACBP = 0b001_010_10_0 = 0x2A. With B=1, length field must be 0.
+    data.extend(make_record(0x98, &[0x2A, 0x00, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(sec.size(), 0x10000);
+    assert!(sec.data().unwrap().iter().all(|&b| b == 0));
+}
+
+#[test]
+fn omf_fixupp_no_data_target() {
+    // FIXUPP with fixup subrecords but no preceding data target must error.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00]));
+    // FIXUPP with no preceding LEDATA/LIDATA
+    data.extend(make_record(0x9C, &[0x84, 0x00, 0x42, 0x01, 0x00, 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let result = OmfFile::parse(&data[..]);
+    assert!(result.is_err());
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        "FIXUPP with no preceding data record"
+    );
 }
 
 // ── New tests for full FIXUP variant support ──────────────────────────────
