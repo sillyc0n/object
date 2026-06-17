@@ -15,6 +15,8 @@ pub const RT_THEADR: u8 = 0x80;
 pub const RT_COMENT: u8 = 0x88;
 /// MODEND: Module End Record.
 pub const RT_MODEND: u8 = 0x8A;
+/// MODEND32: 32-bit Module End Record (target displacement is 32-bit).
+pub const RT_MODEND32: u8 = 0x8B;
 /// EXTDEF: External Names Definition Record.
 pub const RT_EXTDEF: u8 = 0x8C;
 /// LEXTDEF: Local External Names Definition Record.
@@ -242,7 +244,8 @@ pub fn read_name(data: &[u8], offset: usize) -> Option<(&[u8], usize)> {
 pub fn read_varlen(data: &[u8], offset: usize) -> Option<(u32, usize)> {
     let b0 = *data.get(offset)?;
     match b0 {
-        0x00..=0x7F => Some((b0 as u32, 1)),
+        // Note: 0x80 is a valid single-byte value (128) per COMDEF/TYPDEF spec.
+        0x00..=0x80 => Some((b0 as u32, 1)),
         0x81 => {
             let lo = *data.get(offset + 1)?;
             let hi = *data.get(offset + 2)?;

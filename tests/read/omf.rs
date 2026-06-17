@@ -1085,6 +1085,143 @@ fn omf_comdat_communal() {
 }
 
 #[test]
+fn omf_comdef_ledata_fixupp() {
+    // Verify LEDATA -> COMDEF data copy and FIXUPP attach to communal entry,
+    // and that normal segment LEDATA+FIXUPP behavior remains unchanged.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+
+    // MS extensions comment (keeps compatibility with COMDEF tests)
+    data.extend(make_record(0x88, &[0x00, 0xA1]));
+
+    // COMDEF: name="foo", type_idx=0, DST=NEAR (0x62), size=3
+    data.extend(make_record(0xB0, &[0x03, b'f', b'o', b'o', 0x00, 0x62, 0x03]));
+
+    // LEDATA targeting the COMDEF-derived ordinal. This LEDATA should write
+    // its payload into the ParsedComdefEntry.data buffer. At this point no
+    // SEGDEF has been seen, so index=1 resolves to the COMDEF ordinal.
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0xAA, 0xBB, 0xCC]));
+    // FIXUPP for the communal LEDATA: explicit target method=2 (external), datum=1, disp=0
+    // Encoded: locat=0x8400 (0x84,0x00), fix_dat=0x42, datum=0x01, disp=0x0000
+    data.extend(make_record(0x9C, &[0x84, 0x00, 0x42, 0x01, 0x00, 0x00]));
+
+    // Now append LNAMES and a SEGDEF for a normal segment (to verify normal behavior)
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    // SEGDEF: acbp=0x48, length=0x10, name=1, class=1, overlay=1
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+
+    // LEDATA for normal segment 1: write one byte 0x11 at offset 0
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x11]));
+    // FIXUPP immediately following: locat=0xC400, fix_dat=0x40 (method 0 = seg), datum=1, disp=0
+    data.extend(make_record(0x9C, &[0xC4, 0x00, 0x40, 0x01, 0x00, 0x00]));
+
+    data.extend(make_record(0x8A, &[0x01]));
+
+    let obj = OmfFile::parse(&data[..]).unwrap();
+
+    // COMDEF communal checks via raw_comdefs API
+    let comdefs = obj.raw_comdefs();
+    assert_eq!(comdefs.len(), 1);
+    let comdef = &comdefs[0];
+    assert_eq!(&comdef.data[..], &[0xAA, 0xBB, 0xCC]);
+    assert_eq!(comdef.relocs.len(), 1);
+    let creloc = &comdef.relocs[0];
+    assert_eq!(creloc.offset, 0);
+    assert_eq!(creloc.target, object::read::omf::RelocTarget::External(1));
+
+    // Normal segment check: segment 0 (first) should contain 0x11 at offset 0
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(sec.data().unwrap()[0], 0x11);
+    // The relocation for the normal segment should be present.
+    let mut seg_relocs = sec.relocations();
+    let (_off, r) = seg_relocs.next().unwrap();
+    assert_eq!(r.target(), RelocationTarget::Section(SectionIndex(0)));
+}
+
+#[test]
+fn omf_comdef_lidata_fixupp() {
+    // Verify LIDATA -> COMDEF data copy and FIXUPP attach to communal entry.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+
+    // MS extensions comment
+    data.extend(make_record(0x88, &[0x00, 0xA1]));
+
+    // COMDEF: name="foo", type_idx=0, DST=NEAR (0x62), size=3
+    data.extend(make_record(0xB0, &[0x03, b'f', b'o', b'o', 0x00, 0x62, 0x03]));
+
+    // LIDATA targeting the COMDEF-derived ordinal. Build a flat LIDATA block
+    // repeat=1, block_count=0, byte_count=3, data=AA BB CC
+    data.extend(make_record(
+        0xA2,
+        &[
+            0x01, // seg idx = 1 (resolves to COMDEF ordinal)
+            0x00, 0x00, // offset = 0
+            0x01, 0x00, // repeat = 1
+            0x00, 0x00, // block_count = 0 (flat)
+            0x03,       // byte_count = 3
+            0xAA, 0xBB, 0xCC,
+        ],
+    ));
+    // FIXUPP for the communal LIDATA: explicit target method=2 (external), datum=1, disp=0
+    data.extend(make_record(0x9C, &[0x84, 0x00, 0x42, 0x01, 0x00, 0x00]));
+
+    // Now append LNAMES and a SEGDEF for a normal segment (to verify normal behavior)
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+
+    // LEDATA for normal segment 1: write one byte 0x11 at offset 0
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x11]));
+    // FIXUPP immediately following: locat=0xC400, fix_dat=0x40 (method 0 = seg), datum=1, disp=0
+    data.extend(make_record(0x9C, &[0xC4, 0x00, 0x40, 0x01, 0x00, 0x00]));
+
+    data.extend(make_record(0x8A, &[0x01]));
+
+    let obj = OmfFile::parse(&data[..]).unwrap();
+
+    // COMDEF communal checks via raw_comdefs API
+    let comdefs = obj.raw_comdefs();
+    assert_eq!(comdefs.len(), 1);
+    let comdef = &comdefs[0];
+    assert_eq!(&comdef.data[..], &[0xAA, 0xBB, 0xCC]);
+    assert_eq!(comdef.relocs.len(), 1);
+    let creloc = &comdef.relocs[0];
+    assert_eq!(creloc.offset, 0);
+    assert_eq!(creloc.target, object::read::omf::RelocTarget::External(1));
+
+    // Normal segment check: segment 0 (first) should contain 0x11 at offset 0
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(sec.data().unwrap()[0], 0x11);
+    // The relocation for the normal segment should be present.
+    let mut seg_relocs = sec.relocations();
+    let (_off, r) = seg_relocs.next().unwrap();
+    assert_eq!(r.target(), RelocationTarget::Section(SectionIndex(0)));
+}
+
+#[test]
+fn omf_ledata_two_byte_borland_index() {
+    // Ensure two-byte LEDATA encodings with high-bit markers like C0 01
+    // are classified to the intended low ordinal when produced by
+    // Borland-style emitters.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+
+    // LEDATA using two-byte encoding C0 01 which decodes naively to 16385
+    // but should resolve to ordinal 1.
+    data.extend(make_record(0xA0, &[0xC0, 0x01, 0x00, 0x00, 0xAA, 0xBB]));
+
+    // Terminate object
+    data.extend(make_record(0x8A, &[0x01]));
+
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    // There should be at least one section and its first byte should match 0xAA
+    let sec = obj.sections().next().unwrap();
+    assert_eq!(sec.data().unwrap()[0], 0xAA);
+}
+
+#[test]
 fn omf_thread_subrecords_api() {
     // thread_subrecords() collects all THREAD subrecords from all FIXUPP records.
     let mut data = Vec::new();

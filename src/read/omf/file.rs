@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use alloc::string::String;
 use core::fmt::Debug;
 use core::marker::PhantomData;
 
@@ -10,6 +11,15 @@ use crate::read::{
 use crate::Endianness;
 
 use super::*;
+
+// Represents the target of a LEDATA/LIDATA record: either a segment ordinal
+// (1-based) or a communal (COMDEF-derived) ordinal (EXTDEF ordinal).
+#[derive(Clone, Debug)]
+enum DataTarget {
+    Segment(u16),
+    Communal { comdef_ord: u16 },
+    Unknown,
+}
 
 /// An OMF object file.
 #[derive(Debug)]
@@ -26,6 +36,8 @@ use super::*;
     pub symbols: Vec<ParsedSymbol<'data>>,
     /// Parsed TYPDEF records (obsolete compatibility records).
     pub typdefs: Vec<ParsedTypDefRecord<'data>>,
+    /// Parsed COMDEF entries (communal variables) found in the file.
+    pub comdefs: Vec<crate::read::omf::ParsedComdefEntry<'data>>,
     /// Decoded FIXUPP records for dump purposes.
     fixupp_records: Vec<ParsedFixuppRecord>,
     pub(super) extdef_symbol_indices: Vec<SymbolIndex>,
@@ -52,6 +64,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             groups: Vec::new(),
             symbols: Vec::new(),
             typdefs: Vec::new(),
+            comdefs: Vec::new(),
             fixupp_records: Vec::new(),
             extdef_symbol_indices: Vec::new(),
             entry: EntryPoint::None,
@@ -68,7 +81,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
     fn scan(&mut self, data: &'data [u8]) -> Result<()> {
         let mut pos = 0;
-        let mut last_data_seg_ordinal: Option<u16> = None;
+        // The most recent data record target. Previously this was tracked as
+        // an ordinal assuming segment-only targets (last_data_seg_ordinal).
+        // Track a richer target so FIXUPP can attach relocations either to a
+        // segment or to a communal (COMDEF-derived) entry.
+        let mut last_data_target: Option<DataTarget> = None;
         let mut last_data_seg_offset: u16 = 0;
         // Tracks whether the most recently processed record was LEDATA/LIDATA.
         let mut prev_was_data_record = false;
@@ -101,6 +118,16 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 return Err(Error("truncated OMF record"));
             }
             let record_bytes = &data[pos..pos + 3 + record_length];
+            #[cfg(debug_assertions)]
+            {
+                eprintln!(
+                    "RECORD @0x{:X}: type=0x{:02X} len={} (body_len={})",
+                    pos,
+                    record_type,
+                    record_length,
+                    record_length.saturating_sub(1)
+                );
+            }
             // Verify checksum. Mismatches are non-fatal; the verifier may
             // emit a warning but parsing continues to match historical
             // behavior and real-world files.
@@ -174,21 +201,67 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     prev_was_data_record = false;
                 }
                 omf::RT_LEDATA => {
-                    let (ord, off) = self.parse_ledata(record_body)?;
-                    last_data_seg_ordinal = Some(ord);
+                    #[cfg(debug_assertions)]
+                    {
+                        // Dump the raw 0xA0 record body preview before attempting
+                        // to interpret it as LEDATA. This helps detect Borland
+                        // variants that reuse the 0xA0 opcode but have a
+                        // different body layout.
+                        let preview_len = core::cmp::min(record_body.len(), 16);
+                        use core::fmt::Write as _;
+                        let mut s = String::new();
+                        for b in &record_body[..preview_len] {
+                            write!(&mut s, "{:02X} ", b).ok();
+                        }
+                        if record_body.len() > preview_len {
+                            write!(&mut s, "...").ok();
+                        }
+                        eprintln!("LEDATA raw @0x{:X} body_preview={}", pos, s);
+                    }
+                    #[cfg(debug_assertions)]
+                    {
+                        // Preview the encoded segment index and computed ordinal
+                        if let Some((idx, c)) = omf::read_index(record_body, 0) {
+                            let enc = &record_body[..core::cmp::min(c, record_body.len())];
+                            use core::fmt::Write as _;
+                            let mut s = String::new();
+                            for b in enc {
+                                write!(&mut s, "{:02X} ", b).ok();
+                            }
+                            eprintln!("About to parse LEDATA @0x{:X}: encoded_index=[{}] decoded_index={}", pos, s, idx);
+                        } else {
+                            eprintln!("About to parse LEDATA @0x{:X}: unable to decode index preview", pos);
+                        }
+                    }
+                    let (target, off) = self.parse_ledata(record_body)?;
+                    last_data_target = Some(target);
                     last_data_seg_offset = off;
                     prev_was_data_record = true;
                 }
                 omf::RT_LIDATA => {
-                    let (ord, off) = self.parse_lidata(record_body)?;
-                    last_data_seg_ordinal = Some(ord);
+                    #[cfg(debug_assertions)]
+                    {
+                        if let Some((idx, c)) = omf::read_index(record_body, 0) {
+                            let enc = &record_body[..core::cmp::min(c, record_body.len())];
+                            use core::fmt::Write as _;
+                            let mut s = String::new();
+                            for b in enc {
+                                write!(&mut s, "{:02X} ", b).ok();
+                            }
+                            eprintln!("About to parse LIDATA @0x{:X}: encoded_index=[{}] decoded_index={}", pos, s, idx);
+                        } else {
+                            eprintln!("About to parse LIDATA @0x{:X}: unable to decode index preview", pos);
+                        }
+                    }
+                    let (target, off) = self.parse_lidata(record_body)?;
+                    last_data_target = Some(target);
                     last_data_seg_offset = off;
                     prev_was_data_record = true;
                 }
                 omf::RT_FIXUPP | omf::RT_FIXUPP32 => {
                     self.parse_fixupp(
                         record_body,
-                        last_data_seg_ordinal,
+                        last_data_target.clone(),
                         last_data_seg_offset,
                         &mut thread_table,
                         record_type == omf::RT_FIXUPP32,
@@ -198,9 +271,14 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     // longer adjacent to data.
                     prev_was_data_record = false;
                 }
-                omf::RT_MODEND => {
-                    self.parse_modend(record_body)?;
-                    // pos += 3 + record_length; // this is redundant - MODEND record is, by definition, the last record in an object module
+                omf::RT_MODEND | omf::RT_MODEND32 => {
+                    // MODEND (0x8A) and MODEND32 (0x8B) differ only in the
+                    // width of the target displacement field. The record body
+                    // passed here excludes the checksum byte and the leading
+                    // type/length header; parse_modend will validate the body
+                    // and set the module entry point appropriately.
+                    let is_32 = record_type == omf::RT_MODEND32;
+                    self.parse_modend(record_body, is_32)?;
                     break;
                 }
                 omf::RT_COMENT => {
@@ -252,6 +330,16 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     /// Verify the checksum of a single OMF record and return an optional
     /// diagnostic message when the checksum mismatches.
     fn verify_record_checksum(record_bytes: &[u8], pos: usize, record_type: u8) -> Option<&'static str> {
+        // If the stored checksum byte is 0x00, interpret that as "checksum
+        // omitted" and accept the record unconditionally (some toolchains do
+        // not emit a checksum). Otherwise verify that the sum of all bytes is
+        // zero modulo 256; mismatches are reported non-fatally.
+        if let Some(&stored) = record_bytes.last() {
+            if stored == 0x00 {
+                return None;
+            }
+        }
+
         let mut sum = 0u8;
         for &b in record_bytes {
             sum = sum.wrapping_add(b);
@@ -360,6 +448,20 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             flat_base: 0,
             _marker: PhantomData,
         });
+
+        #[cfg(debug_assertions)]
+        {
+            // Debug: report the new segment count and ordinal after a
+            // SEGDEF is parsed. This helps detect whether later LEDATA/LIDATA
+            // records refer to the expected segment ordinals.
+            eprintln!(
+                "SEGDEF parsed: total_segments={} new_ordinal={} name_idx={:?} class_idx={:?}",
+                self.segments.len(),
+                ordinal,
+                if seg_name_idx == 0 { None } else { Some(seg_name_idx - 1) },
+                if class_name_idx == 0 { None } else { Some(class_name_idx - 1) }
+            );
+        }
 
         Ok(())
     }
@@ -591,11 +693,8 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         Ok(())
     }
 
-    fn parse_ledata(&mut self, body: &[u8]) -> Result<(u16, u16)> {
+    fn parse_ledata(&mut self, body: &[u8]) -> Result<(DataTarget, u16)> {
         let (seg_idx, c) = omf::read_index(body, 0).read_error("truncated LEDATA segment")?;
-        if seg_idx == 0 || seg_idx as usize > self.segments.len() {
-            return Err(Error("LEDATA segment index out of range"));
-        }
 
         if c + 2 > body.len() {
             return Err(Error("truncated LEDATA offset"));
@@ -608,26 +707,147 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             return Err(Error("LEDATA data field exceeds 1024-byte LINK limit"));
         }
 
-        let seg = &mut self.segments[seg_idx as usize - 1];
-
+        let available_segments = self.segments.len();
         let required = data_offset + data_bytes.len();
-        if required > 0x10000 {
-            return Err(Error("LEDATA data overflow: exceeds 64 KB segment limit"));
+
+        #[cfg(debug_assertions)]
+        {
+            eprintln!(
+                "LEDATA: targeting seg_idx={} (available_segments={}) data_offset={} data_len={} required={}",
+                seg_idx,
+                available_segments,
+                data_offset,
+                data_bytes.len(),
+                required
+            );
         }
 
-        if seg.data.len() < required {
-            seg.data.resize(required, 0);
-        }
-        seg.data[data_offset..required].copy_from_slice(data_bytes);
+        // Classify the decoded index into a target kind before acting.
+        let mut target = self.classify_data_target(seg_idx);
 
-        Ok((seg_idx, data_offset as u16))
+        // Some toolchains (notably Borland) set extra high bits in the
+        // two-byte index encoding. If the nominal decoded index does not
+        // resolve, attempt a relaxed re-decode for two-byte encodings by
+        // clearing the bit-6 marker and also try the low byte alone. Do
+        // this only when the initial classification yields Unknown so we
+        // avoid changing behavior for well-formed files.
+        if let DataTarget::Unknown = target {
+            if c == 2 {
+                if let Some(&b0) = body.get(0) {
+                    if let Some(&b1) = body.get(1) {
+                        // Clear bit 6 (0x40) from the high-order 7 bits and
+                        // reassemble. For C0 01 this yields ordinal 1.
+                        let alt1 = ((((b0 & 0x7F) & !0x40) as u16) << 8) | (b1 as u16);
+                        let t1 = self.classify_data_target(alt1);
+                        if !matches!(t1, DataTarget::Unknown) {
+                            target = t1;
+                        } else {
+                            // Try low byte only.
+                            let alt2 = b1 as u16;
+                            let t2 = self.classify_data_target(alt2);
+                            if !matches!(t2, DataTarget::Unknown) {
+                                target = t2;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            use core::fmt::Write as _;
+            let mut extra = String::new();
+            match &target {
+                DataTarget::Segment(o) => {
+                    if let Some(seg) = self.segments.get(*o as usize - 1) {
+                        if seg.name_idx != u16::MAX {
+                            if let Some(n) = self.lname(seg.name_idx) {
+                                write!(&mut extra, "target=segment ordinal={} name=", o).ok();
+                                for &b in n {
+                                    write!(&mut extra, "{:02X}", b).ok();
+                                }
+                            } else {
+                                write!(&mut extra, "target=segment ordinal={} name=<invalid>", o).ok();
+                            }
+                        } else {
+                            write!(&mut extra, "target=segment ordinal={} (unnamed)", o).ok();
+                        }
+                    } else {
+                        write!(&mut extra, "target=segment ordinal={} (missing)", o).ok();
+                    }
+                }
+                DataTarget::Communal { comdef_ord } => {
+                    write!(&mut extra, "target=communal ordinal(extdef)={}", comdef_ord).ok();
+                }
+                DataTarget::Unknown => {
+                    write!(&mut extra, "target=unknown idx={}", seg_idx).ok();
+                }
+            }
+            eprintln!(
+                "LEDATA debug: {} data_offset={} data_len={} required={}",
+                extra, data_offset, data_bytes.len(), required
+            );
+        }
+
+        // Branch on the classified target and perform the write.
+        match target {
+            DataTarget::Segment(ord) => {
+                if ord == 0 || (ord as usize) > self.segments.len() {
+                    return Err(Error("LEDATA segment index out of range"));
+                }
+                let seg = &mut self.segments[ord as usize - 1];
+                if required > 0x10000 {
+                    return Err(Error("LEDATA data overflow: exceeds 64 KB segment limit"));
+                }
+                if seg.data.len() < required {
+                    seg.data.resize(required, 0);
+                }
+                seg.data[data_offset..required].copy_from_slice(data_bytes);
+                return Ok((DataTarget::Segment(ord), data_offset as u16));
+            }
+            DataTarget::Communal { comdef_ord } => {
+                // communal target: write into the comdef buffer
+                let ordinal = comdef_ord;
+                if ordinal == 0 || (ordinal as usize) > self.extdef_symbol_indices.len() {
+                    return Err(Error("LEDATA segment index out of range"));
+                }
+                let sym_index = self.extdef_symbol_indices[ordinal as usize - 1];
+                if let Some((comdat_pos, _)) = self
+                    .comdat_groups
+                    .iter()
+                    .enumerate()
+                    .find(|(_i, (sidx, _))| *sidx == sym_index)
+                {
+                    if comdat_pos < self.comdefs.len() {
+                        let comdef = &mut self.comdefs[comdat_pos];
+                        let req = data_offset + data_bytes.len();
+                        if comdef.data.len() < req {
+                            comdef.data.resize(req, 0);
+                        }
+                        comdef.data[data_offset..req].copy_from_slice(data_bytes);
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "LEDATA -> COMDEF: comdef_idx={} sym_index={} data_offset={} data_len={} required={}",
+                            comdat_pos + 1,
+                            sym_index.0,
+                            data_offset,
+                            data_bytes.len(),
+                            req
+                        );
+                        return Ok((DataTarget::Communal { comdef_ord: ordinal }, data_offset as u16));
+                    }
+                }
+                return Err(Error("LEDATA segment index out of range"));
+            }
+            DataTarget::Unknown => return Err(Error("LEDATA segment index out of range")),
+        }
     }
 
-    fn parse_lidata(&mut self, body: &[u8]) -> Result<(u16, u16)> {
+    fn parse_lidata(&mut self, body: &[u8]) -> Result<(DataTarget, u16)> {
         let (seg_idx, c) = omf::read_index(body, 0).read_error("truncated LIDATA segment")?;
-        if seg_idx == 0 || seg_idx as usize > self.segments.len() {
-            return Err(Error("LIDATA segment index out of range"));
-        }
+        // Allow seg_idx==0 to be handled by resolution logic below; do not
+        // early-return here so communal (COMDEF) mapping can be attempted.
 
         if c + 2 > body.len() {
             return Err(Error("truncated LIDATA offset"));
@@ -645,23 +865,116 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             return Err(Error("unexpected trailing bytes in LIDATA"));
         }
 
-        let seg = &mut self.segments[seg_idx as usize - 1];
-        let required = data_offset + expanded.len();
-        if required > 0x10000 {
-            return Err(Error("LIDATA data overflow"));
-        }
-        if seg.data.len() < required {
-            seg.data.resize(required, 0);
-        }
-        seg.data[data_offset..required].copy_from_slice(&expanded);
+        let available_segments = self.segments.len();
 
-        Ok((seg_idx, data_offset as u16))
+        #[cfg(debug_assertions)]
+        {
+            eprintln!(
+                "LIDATA: targeting seg_idx={} (available_segments={}) data_offset={} expanded_len={}",
+                seg_idx,
+                available_segments,
+                data_offset,
+                expanded.len()
+            );
+        }
+
+        // Classify the decoded index into a target kind before acting.
+        let target = self.classify_data_target(seg_idx);
+
+        #[cfg(debug_assertions)]
+        {
+            use core::fmt::Write as _;
+            let mut extra = String::new();
+            match &target {
+                DataTarget::Segment(o) => {
+                    if let Some(seg) = self.segments.get(*o as usize - 1) {
+                        if seg.name_idx != u16::MAX {
+                            if let Some(n) = self.lname(seg.name_idx) {
+                                write!(&mut extra, "target=segment ordinal={} name=", o).ok();
+                                for &b in n {
+                                    write!(&mut extra, "{:02X}", b).ok();
+                                }
+                            } else {
+                                write!(&mut extra, "target=segment ordinal={} name=<invalid>", o).ok();
+                            }
+                        } else {
+                            write!(&mut extra, "target=segment ordinal={} (unnamed)", o).ok();
+                        }
+                    } else {
+                        write!(&mut extra, "target=segment ordinal={} (missing)", o).ok();
+                    }
+                }
+                DataTarget::Communal { comdef_ord } => {
+                    write!(&mut extra, "target=communal ordinal(extdef)={}", comdef_ord).ok();
+                }
+                DataTarget::Unknown => {
+                    write!(&mut extra, "target=unknown idx={}", seg_idx).ok();
+                }
+            }
+            eprintln!(
+                "LIDATA debug: {} data_offset={} expanded_len={}",
+                extra, data_offset, expanded.len()
+            );
+        }
+
+        // Normal segment target: store into segment's data buffer.
+        match target {
+            DataTarget::Segment(ord) => {
+                if ord == 0 || (ord as usize) > self.segments.len() {
+                    return Err(Error("LIDATA segment index out of range"));
+                }
+                let seg = &mut self.segments[ord as usize - 1];
+                let required = data_offset + expanded.len();
+                if required > 0x10000 {
+                    return Err(Error("LIDATA data overflow"));
+                }
+                if seg.data.len() < required {
+                    seg.data.resize(required, 0);
+                }
+                seg.data[data_offset..required].copy_from_slice(&expanded);
+                return Ok((DataTarget::Segment(ord), data_offset as u16));
+            }
+            DataTarget::Communal { comdef_ord } => {
+                let ordinal = comdef_ord;
+                if ordinal == 0 || (ordinal as usize) > self.extdef_symbol_indices.len() {
+                    return Err(Error("LIDATA segment index out of range"));
+                }
+                let sym_index = self.extdef_symbol_indices[ordinal as usize - 1];
+                if let Some((comdat_pos, _)) = self
+                    .comdat_groups
+                    .iter()
+                    .enumerate()
+                    .find(|(_i, (sidx, _))| *sidx == sym_index)
+                {
+                    if comdat_pos < self.comdefs.len() {
+                        let comdef = &mut self.comdefs[comdat_pos];
+                        let req = data_offset + expanded.len();
+                        if comdef.data.len() < req {
+                            comdef.data.resize(req, 0);
+                        }
+                        comdef.data[data_offset..req].copy_from_slice(&expanded);
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "LIDATA -> COMDEF: comdef_idx={} sym_index={} data_offset={} expanded_len={} required={}",
+                            comdat_pos + 1,
+                            sym_index.0,
+                            data_offset,
+                            expanded.len(),
+                            req
+                        );
+                        return Ok((DataTarget::Communal { comdef_ord: ordinal }, data_offset as u16));
+                    }
+                }
+                return Err(Error("LIDATA segment index out of range"));
+            }
+            DataTarget::Unknown => return Err(Error("LIDATA segment index out of range")),
+        }
     }
 
     fn parse_fixupp(
         &mut self,
         body: &[u8],
-        last_seg_ordinal: Option<u16>,
+        last_data_target: Option<DataTarget>,
         ledata_offset: u16,
         thread_table: &mut ThreadTable,
         is_32bit: bool,
@@ -756,22 +1069,75 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                         3 => RelocTarget::AbsoluteFrame(target.datum.unwrap_or(0)),
                         _ => continue,
                     };
-                    let seg_ordinal =
-                        last_seg_ordinal.ok_or(Error("FIXUPP with no preceding data record"))?;
-                    let seg = &mut self.segments[seg_ordinal as usize - 1];
-                    seg.relocs.push(ParsedReloc {
-                        offset: ledata_offset + rec_offset,
-                        loc,
-                        is_seg_rel,
-                        target: reloc_target,
-                        displacement: target_displacement.unwrap_or(0),
-                    });
+                    let data_target = last_data_target
+                        .as_ref()
+                        .ok_or(Error("FIXUPP with no preceding data record"))?;
+
+                    match data_target {
+                        DataTarget::Segment(seg_ordinal) => {
+                            if *seg_ordinal == 0 || (*seg_ordinal as usize) > self.segments.len() {
+                                return Err(Error("FIXUPP segment index out of range"));
+                            }
+                            let seg = &mut self.segments[*seg_ordinal as usize - 1];
+                            seg.relocs.push(ParsedReloc {
+                                offset: ledata_offset + rec_offset,
+                                loc,
+                                is_seg_rel,
+                                target: reloc_target.clone(),
+                                displacement: target_displacement.unwrap_or(0),
+                            });
+                        }
+                        DataTarget::Communal { comdef_ord } => {
+                            // communal target: map extdef ordinal -> symbol index -> comdat_groups pos -> comdefs index
+                            let ordinal = *comdef_ord;
+                            if ordinal == 0 || (ordinal as usize) > self.extdef_symbol_indices.len() {
+                                return Err(Error("FIXUPP refers to unknown COMDEF ordinal"));
+                            }
+                            let sym_index = self.extdef_symbol_indices[ordinal as usize - 1];
+                            if let Some((comdat_pos, _)) = self
+                                .comdat_groups
+                                .iter()
+                                .enumerate()
+                                .find(|(_i, (sidx, _))| *sidx == sym_index)
+                            {
+                                if comdat_pos < self.comdefs.len() {
+                                    let comdef = &mut self.comdefs[comdat_pos];
+                                    comdef.relocs.push(ParsedReloc {
+                                        offset: ledata_offset + rec_offset,
+                                        loc,
+                                        is_seg_rel,
+                                        target: reloc_target.clone(),
+                                        displacement: target_displacement.unwrap_or(0),
+                                    });
+                                    #[cfg(debug_assertions)]
+                                    eprintln!(
+                                        "FIXUPP -> COMDEF: comdef_idx={} sym_index={} offset={} loc={} target={:?}",
+                                        comdat_pos + 1,
+                                        sym_index.0,
+                                        ledata_offset + rec_offset,
+                                        loc,
+                                        reloc_target
+                                    );
+                                } else {
+                                    return Err(Error("FIXUPP refers to unknown COMDEF ordinal"));
+                                }
+                            } else {
+                                return Err(Error("FIXUPP refers to unknown COMDEF symbol"));
+                            }
+                        }
+                        &DataTarget::Unknown => return Err(Error("FIXUPP segment index out of range")),
+                    }
                 }
             }
         }
 
+        let attached_seg_ordinal = last_data_target.as_ref().and_then(|t| match t {
+            DataTarget::Segment(o) => Some(*o),
+            _ => None,
+        });
+
         self.fixupp_records.push(ParsedFixuppRecord {
-            attached_seg_ordinal: last_seg_ordinal,
+            attached_seg_ordinal,
             subrecords,
             thread_table: start_thread_table,
         });
@@ -779,17 +1145,20 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         Ok(())
     }
 
-    fn parse_modend(&mut self, body: &[u8]) -> Result<()> {
+    fn parse_modend(&mut self, body: &[u8], is_32bit: bool) -> Result<()> {
         if body.is_empty() {
             return Err(Error("truncated MODEND"));
         }
         let module_type = body[0];
 
+        // No start address -> module has no entry point.
         if module_type & omf::MODEND_START == 0 {
             self.entry = EntryPoint::None;
             return Ok(());
         }
 
+        // When Start is set the RELOC (X) bit must typically be present; our
+        // parser treats the absence as unsupported.
         if module_type & omf::MODEND_RELOC == 0 {
             return Err(Error(
                 "MODEND START bit set but RELOC bit clear; absolute start unsupported",
@@ -805,24 +1174,45 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             return Err(Error("MODEND end_dat P bit must be zero"));
         }
 
+        // Parse frame/target using helpers used by FIXUPP parsing. The
+        // ThreadTable is empty here because MODEND start address uses the
+        // fixed end_dat rather than referencing existing thread state.
         let empty_threads = ThreadTable::new();
         let _frame = resolve_frame_from_fixdat(body, &mut pos, end_dat, &empty_threads)?;
         let target = resolve_target_from_fixdat(body, &mut pos, end_dat, &empty_threads)?
             .ok_or(Error("MODEND target method unsupported"))?;
 
         let displacement = if (target.method & 0x04) == 0 {
-            if pos + 2 > body.len() {
-                return Err(Error("truncated MODEND target displacement"));
+            if is_32bit {
+                if pos + 4 > body.len() {
+                    return Err(Error("truncated MODEND32 target displacement"));
+                }
+                let d = u32::from_le_bytes([
+                    body[pos],
+                    body[pos + 1],
+                    body[pos + 2],
+                    body[pos + 3],
+                ]);
+                pos += 4;
+                // clamp into u32; stored EntryPoint uses u32 for displacement
+                d as u64
+            } else {
+                if pos + 2 > body.len() {
+                    return Err(Error("truncated MODEND target displacement"));
+                }
+                let d = u16::from_le_bytes([body[pos], body[pos + 1]]) as u64;
+                pos += 2;
+                d
             }
-            let d = u16::from_le_bytes([body[pos], body[pos + 1]]);
-            pos += 2;
-            d
         } else {
             0
-        };
+        } as u64;
 
+        // Map to existing EntryPoint enum which stores a 32-bit displacement
+        // when appropriate. We preserve the datum values (EXTDEF/SEG/GROUP)
+        // semantics used elsewhere in the parser.
         self.entry = match target.method {
-            0 | 4 => EntryPoint::Segment(target.datum.unwrap_or(0), displacement),
+            0 | 4 => EntryPoint::Segment(target.datum.unwrap_or(0), displacement as u32),
             1 | 5 => {
                 let grp = self
                     .groups
@@ -833,15 +1223,12 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     .first()
                     .copied()
                     .ok_or(Error("MODEND group has no member segments"))?;
-                EntryPoint::Segment(seg, displacement)
+                EntryPoint::Segment(seg, displacement as u32)
             }
             2 | 6 => {
-                // External entry point: datum is the EXTDEF ordinal, displacement is the offset.
-                EntryPoint::External(target.datum.unwrap_or(0), displacement)
+                EntryPoint::External(target.datum.unwrap_or(0), displacement as u32)
             }
-            _ => {
-                return Err(Error("MODEND target method unsupported"));
-            }
+            _ => return Err(Error("MODEND target method unsupported")),
         };
 
         if pos != body.len() {
@@ -853,10 +1240,30 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
     fn parse_comdef(&mut self, body: &'data [u8]) -> Result<()> {
         let mut pos = 0;
+        #[cfg(debug_assertions)]
+        {
+            // Targeted debug dump for COMDEF records. Prints the overall
+            // record body length and a short hex preview to help diagnose
+            // parser cursor drift when Borland variants or extensions are
+            // present. Only enabled in debug builds to avoid noisy output in
+            // normal use.
+            use core::fmt::Write as _;
+            let mut s = String::new();
+            let preview_len = core::cmp::min(body.len(), 32);
+            for b in &body[..preview_len] {
+                write!(&mut s, "{:02X} ", b).ok();
+            }
+            if body.len() > preview_len {
+                write!(&mut s, "... (len={})", body.len()).ok();
+            } else {
+                write!(&mut s, "(len={})", body.len()).ok();
+            }
+            eprintln!("COMDEF record: {}", s);
+        }
         while pos < body.len() {
             let (name, c) = omf::read_name(body, pos).read_error("truncated COMDEF name")?;
             pos += c;
-            let (_type_idx, c) = omf::read_index(body, pos).read_error("truncated COMDEF type")?;
+            let (type_idx, c) = omf::read_index(body, pos).read_error("truncated COMDEF type")?;
             pos += c;
             if pos >= body.len() {
                 return Err(Error("truncated COMDEF DST"));
@@ -864,31 +1271,83 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             let dst = body[pos];
             pos += 1;
 
+            // Pre-read any variable-length fields so we advance `pos` in the
+            // same way the historical parser did and then construct the
+            // ParsedCommunalKind from the captured values. This avoids
+            // double-reading varlen fields.
+            let mut near_size: Option<u32> = None;
+            let mut far_count: Option<u32> = None;
+            let mut far_elem_size: Option<u32> = None;
+
             match dst {
                 omf::DST_NEAR => {
-                    let (_, c) = omf::read_varlen(body, pos).read_error("truncated COMDEF size")?;
+                    let (size, c) = omf::read_varlen(body, pos).read_error("truncated COMDEF size")?;
                     pos += c;
+                    near_size = Some(size);
                 }
                 omf::DST_FAR => {
-                    let (_, c) =
-                        omf::read_varlen(body, pos).read_error("truncated COMDEF num elements")?;
+                    let (count, c) = omf::read_varlen(body, pos)
+                        .read_error("truncated COMDEF num elements")?;
                     pos += c;
-                    let (_, c) =
-                        omf::read_varlen(body, pos).read_error("truncated COMDEF element size")?;
+                    far_count = Some(count);
+                    let (element_size, c) = omf::read_varlen(body, pos)
+                        .read_error("truncated COMDEF element size")?;
                     pos += c;
+                    far_elem_size = Some(element_size);
+                }
+                0x01..=0x5F => {
+                    // Borland segment variant: historically some Borland toolchains
+                    // emit an extra payload byte after the segment index. If we
+                    // don't consume it the parser's cursor can drift one byte
+                    // past the end of the COMDEF record, leaving an extra
+                    // dangling byte. Consume one additional byte when present
+                    // to remain compatible with these variants.
+                    if pos < body.len() {
+                        #[cfg(debug_assertions)]
+                        {
+                            // Debug: print the next few bytes to help diagnose
+                            // exactly what the Borland payload looks like.
+                            let remaining = body.len().saturating_sub(pos);
+                            let mut preview = String::new();
+                            let preview_len = core::cmp::min(remaining, 8);
+                            for b in &body[pos..pos + preview_len] {
+                                use core::fmt::Write as _;
+                                write!(&mut preview, "{:02X} ", b).ok();
+                            }
+                            eprintln!(
+                                "    Borland DST: consuming extra byte 0x{:02X}; remaining={} next={}",
+                                body[pos],
+                                remaining,
+                                preview
+                            );
+                        }
+                        // Consume the extra Borland payload byte to align the
+                        // parser cursor with the recorded COMDEF boundary.
+                        pos += 1;
+                    }
                 }
                 _ => {
-                    // Unknown DST — skip this entry but continue parsing the
-                    // remainder of the COMDEF record. Historically the parser
-                    // ignored unknown DST values instead of failing, and many
-                    // real-world files use tool-specific values.
-                    // We advance no further here (we don't know the field
-                    // sizes for unknown DST), so conservatively stop parsing
-                    // this COMDEF record.
+                    // Unknown DST — stop parsing this COMDEF record to avoid
+                    // misinterpreting remaining bytes.
                     break;
                 }
             }
 
+            // Record the parsed COMDEF entry in the structured list.
+            let communal = match dst {
+                omf::DST_NEAR => crate::read::omf::ParsedCommunalKind::Near { size: near_size.unwrap_or(0) },
+                omf::DST_FAR => crate::read::omf::ParsedCommunalKind::Far {
+                    count: far_count.unwrap_or(0),
+                    element_size: far_elem_size.unwrap_or(0),
+                },
+                0x01..=0x5F => crate::read::omf::ParsedCommunalKind::BorlandSegment { index: dst },
+                _ => crate::read::omf::ParsedCommunalKind::Opaque(&body[pos..]),
+            };
+
+            self.comdefs.push(crate::read::omf::ParsedComdefEntry { name, type_index: type_idx, communal, data: Vec::new(), relocs: Vec::new() });
+
+            // Preserve historical side effects: create a symbolic entry so
+            // COMDEF variables are visible via symbols/comdat groups.
             let sym_index = SymbolIndex(self.symbols.len());
             self.symbols.push(ParsedSymbol {
                 name,
@@ -906,6 +1365,20 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             // This allows consumers to discover communal variables via the
             // ObjectComdat trait.
             self.comdat_groups.push((sym_index, crate::read::ComdatKind::Any));
+            #[cfg(debug_assertions)]
+            {
+                // Log the cursor after each parsed entry so we can detect
+                // whether parsing has drifted from the expected record
+                // boundaries.
+                eprintln!(
+                    "  COMDEF entry parsed: name={:?} type_idx={} dst=0x{:02X} cursor={} remaining={} bytes",
+                    name,
+                    type_idx,
+                    dst,
+                    pos,
+                    body.len().saturating_sub(pos)
+                );
+            }
         }
         Ok(())
     }
@@ -919,6 +1392,31 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             self.has_ms_ext = true;
         }
         Ok(())
+    }
+
+    /// Classify a decoded LEDATA/LIDATA index into a DataTarget.
+    fn classify_data_target(&self, seg_idx: u16) -> DataTarget {
+        if seg_idx != 0 && (seg_idx as usize) <= self.segments.len() {
+            return DataTarget::Segment(seg_idx);
+        }
+        // Try communal mapping via EXTDEF/COMDEF ordinal space.
+        if seg_idx != 0 && (seg_idx as usize) <= self.extdef_symbol_indices.len() {
+            let ordinal = seg_idx;
+            if let Some(&sym_index) = self.extdef_symbol_indices.get(ordinal as usize - 1) {
+                if let Some((comdat_pos, _)) = self
+                    .comdat_groups
+                    .iter()
+                    .enumerate()
+                    .find(|(_i, (sidx, _))| *sidx == sym_index)
+                {
+                    // If we have a matching comdat/comdef, classify as communal.
+                    if comdat_pos < self.comdefs.len() {
+                        return DataTarget::Communal { comdef_ord: ordinal };
+                    }
+                }
+            }
+        }
+        DataTarget::Unknown
     }
 
     /// Get the symbol index for an external symbol ordinal.
@@ -956,6 +1454,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     /// Raw-format accessor: return the parsed TYPDEF records.
     pub fn raw_typdefs(&self) -> &[crate::read::omf::ParsedTypDefRecord<'data>] {
         &self.typdefs
+    }
+
+    /// Raw-format accessor: return the parsed COMDEF entries.
+    pub fn raw_comdefs(&self) -> &[crate::read::omf::ParsedComdefEntry<'data>] {
+        &self.comdefs
     }
 
     /// Collect all THREAD subrecords from all FIXUPP records.

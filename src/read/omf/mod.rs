@@ -173,6 +173,48 @@ pub struct ParsedTypDefRecord<'data> {
     pub descriptor: ParsedTypDefDescriptor<'data>,
 }
 
+/// A single parsed COMDEF (communal variable) entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedComdefEntry<'data> {
+    /// Communal name (borrowed slice from the OMF data).
+    pub name: &'data [u8],
+    /// Raw type index (1- or 2-byte OMF index).
+    pub type_index: u16,
+    /// Placement and size encoding.
+    pub communal: ParsedCommunalKind<'data>,
+    /// Accumulated data bytes for this communal entry (filled from LEDATA/LIDATA
+    /// records that target the COMDEF/COMDAT ordinal space).
+    pub data: Vec<u8>,
+    /// Relocations attached to this communal entry (parsed from FIXUPP
+    /// records that immediately follow LEDATA/LIDATA targeting the COMDEF
+    /// ordinal space).
+    pub relocs: Vec<ParsedReloc>,
+}
+
+/// Communal kind describing NEAR/FAR/Borland segment encodings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedCommunalKind<'data> {
+    /// NEAR data — flat allocation of `size` bytes.
+    Near {
+        /// Total allocation size in bytes.
+        size: u32,
+    },
+    /// FAR data — `count` elements each of `element_size` bytes.
+    Far {
+        /// Number of elements in the FAR array.
+        count: u32,
+        /// Size of each element in bytes.
+        element_size: u32,
+    },
+    /// Borland segment index (Data Type 0x01–0x5F).
+    BorlandSegment {
+        /// Segment index byte value.
+        index: u8,
+    },
+    /// Unknown/opaque remainder of the COMDEF entry.
+    Opaque(&'data [u8]),
+}
+
 // Variable kinds supported by NEAR descriptors are encoded as a single byte in
 // the record. We store the raw byte here to preserve on-disk fidelity; this
 // keeps the parser tolerant of tool-specific values while still exposing the
@@ -218,7 +260,7 @@ pub enum ParsedSymbolKind {
 }
 
 /// One relocation entry, attached to a segment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedReloc {
     /// Byte offset within the segment's data buffer.
     pub offset: u16,
@@ -233,7 +275,7 @@ pub struct ParsedReloc {
 }
 
 /// The target of an OMF relocation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelocTarget {
     /// A segment.
     Segment(u16),
@@ -263,12 +305,15 @@ pub struct ParsedGroup {
 }
 
 /// The entry point kind for a parsed OMF file.
+///
+/// Note: the offset/displacement is stored as a 32-bit value to support
+/// MODEND32 (0x8B) records which encode a 32-bit start displacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryPoint {
     /// No entry point (module is not main).
     None,
     /// Entry point is a segment ordinal + offset.
-    Segment(u16, u16),
+    Segment(u16, u32),
     /// Entry point is an external symbol ordinal + offset.
-    External(u16, u16),
+    External(u16, u32),
 }
