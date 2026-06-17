@@ -78,8 +78,8 @@ pub struct ParsedThreadSubrecord {
 /// A decoded fixup subrecord.
 #[derive(Debug, Clone)]
 pub struct ParsedFixupSubrecord {
-    /// The offset within the logical data record.
-    pub record_offset: u16,
+    /// The offset within the logical data record (u32 to support 32-bit LEDATA).
+    pub record_offset: u32,
     /// The raw location type from the file.
     pub loc_raw: u8,
     /// The normalized location type.
@@ -102,7 +102,7 @@ pub struct ParsedFixupSubrecord {
     pub target_datum: u16,
     /// The displacement associated with the TARGET, if any.
     pub target_displacement: Option<u32>,
-}
+    }
 
 /// A decoded FIXUPP record containing multiple subrecords.
 #[derive(Debug, Clone)]
@@ -122,8 +122,9 @@ pub struct ParsedSegment<'data> {
     pub name_idx: u16,
     /// 0-based index into OmfFile::lnames. u16::MAX = no class.
     pub class_idx: u16,
-    /// Declared length in bytes from SEGDEF. 0 means 64 KB when big==true.
-    pub length: u16,
+    /// Declared length in bytes from SEGDEF. 0 means max-size when big==true
+    /// (64 KB for 0x98, 4 GB for 0x99).
+    pub length: u32,
     /// True when the ACBP B-bit is set (segment is exactly 64 KB).
     pub big: bool,
     /// Alignment in bytes derived from the ACBP A-field.
@@ -262,8 +263,8 @@ pub enum ParsedSymbolKind {
 /// One relocation entry, attached to a segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedReloc {
-    /// Byte offset within the segment's data buffer.
-    pub offset: u16,
+    /// Byte offset within the segment's data buffer (u32 for LEDATA32 support).
+    pub offset: u32,
     /// Effective loc value after normalization.
     pub loc: u8,
     /// True if segment-relative; false if self-relative.
@@ -302,6 +303,59 @@ pub struct ParsedGroup {
     pub name_idx: u16,
     /// 1-based SEGDEF ordinals of all member segments, in encounter order.
     pub members: Vec<u16>,
+    /// Ordinals referenced by the group that were not materialized at parse time.
+    /// These are kept so consumers can inspect unresolved references rather than
+    /// failing the entire parse when toolchains emit groups ahead of segment
+    /// declarations or use alternative segment encoding schemes.
+    pub unresolved: Vec<u16>,
+    /// Resolved view of members after finalize(): for each entry in `members`,
+    /// Some(ordinal) when that ordinal was materialized and None when it was
+    /// unresolved at parse time. Populated by OmfFile::finalize().
+    pub resolved_members: Vec<Option<u16>>,
+    /// Full list of decoded components in the GRPDEF record. This preserves
+    /// non-segment components (Intel-specific forms) so the parser remains
+    /// stream-aligned and lossless.
+    pub components: Vec<ParsedGroupComponent>,
+}
+
+/// One GRPDEF component decoded from the file.
+#[derive(Debug, Clone)]
+pub enum ParsedGroupComponent {
+    /// A plain segment reference component (0xFF).
+    Segment {
+        /// 1-based SEGDEF ordinal.
+        seg_index: u16,
+    },
+    /// External (EXTDEF) component (0xFE).
+    External {
+        /// 1-based EXTDEF ordinal.
+        ext_index: u16,
+    },
+    /// Name triple component (0xFD): seg-name, class-name, overlay-name.
+    NameTriple {
+        /// 1-based LNAMES index for the segment name.
+        seg_name_index: u16,
+        /// 1-based LNAMES index for the class name.
+        class_name_index: u16,
+        /// 1-based LNAMES index for the overlay name.
+        overlay_name_index: u16,
+    },
+    /// LTL component (0xFB) carrying LTL data and group length fields.
+    Ltl {
+        /// Raw LTL data byte.
+        ltl_data: u8,
+        /// Maximum group length value.
+        max_group_length: u16,
+        /// Actual group length value.
+        group_length: u16,
+    },
+    /// Absolute frame component (0xFA) with frame number and offset.
+    AbsoluteFrame {
+        /// Frame number.
+        frame_number: u16,
+        /// Offset within the frame.
+        offset: u16,
+    },
 }
 
 /// The entry point kind for a parsed OMF file.

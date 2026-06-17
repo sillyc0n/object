@@ -33,6 +33,8 @@ pub const RT_LINNUM: u8 = 0x94;
 pub const RT_LNAMES: u8 = 0x96;
 /// SEGDEF: Segment Definition Record.
 pub const RT_SEGDEF: u8 = 0x98;
+/// SEGDEF32: 32-bit Segment Definition Record.
+pub const RT_SEGDEF32: u8 = 0x99;
 /// GRPDEF: Group Definition Record.
 pub const RT_GRPDEF: u8 = 0x9A;
 /// FIXUPP: Fixup Record.
@@ -41,6 +43,8 @@ pub const RT_FIXUPP: u8 = 0x9C;
 pub const RT_FIXUPP32: u8 = 0x9D;
 /// LEDATA: Logical Enumerated Data Record.
 pub const RT_LEDATA: u8 = 0xA0;
+/// LEDATA32: 32-bit enumerated data offset.
+pub const RT_LEDATA32: u8 = 0xA1;
 /// LIDATA: Logical Iterated Data Record.
 pub const RT_LIDATA: u8 = 0xA2;
 /// COMDEF: Communal Names Definition Record.

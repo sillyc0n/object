@@ -86,9 +86,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         // Track a richer target so FIXUPP can attach relocations either to a
         // segment or to a communal (COMDEF-derived) entry.
         let mut last_data_target: Option<DataTarget> = None;
-        let mut last_data_seg_offset: u16 = 0;
-        // Tracks whether the most recently processed record was LEDATA/LIDATA.
-        let mut prev_was_data_record = false;
+        let mut last_data_seg_offset: u32 = 0;
         // THREAD state persists across successive FIXUPP records for the duration of module scanning.
         let mut thread_table = ThreadTable::new();
         let mut first_record = true;
@@ -134,73 +132,120 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             let _ = Self::verify_record_checksum(record_bytes, pos, record_type);
             let record_body = &data[pos + 3..pos + 3 + record_length - 1];
 
+            // For targeted debugging of the Watcom file: when scanning past
+            // the early headers (0x3D), emit a concise per-record summary
+            // after dispatch indicating whether we attempted to parse the
+            // body as a Borland-style SEGDEF. This helps identify which
+            // records could have contributed additional ParsedSegment
+            // entries but did not.
+            let is_post_0x3d = pos >= 0x3E;
+
             match record_type {
                 omf::RT_THEADR => {
-                    if prev_was_data_record {
-                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
-                    }
                     self.parse_theadr(record_body)?;
-                    prev_was_data_record = false;
+                    last_data_target = None;
                 }
                 omf::RT_LNAMES => {
-                    if prev_was_data_record {
-                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
-                    }
                     self.parse_lnames(record_body)?;
-                    prev_was_data_record = false;
+                    last_data_target = None;
                 }
-                omf::RT_SEGDEF => {
-                    if prev_was_data_record {
-                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
+                omf::RT_SEGDEF | omf::RT_SEGDEF32 => {
+                    if is_post_0x3d {
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "SEGDEF @0x{:X}: will call parse_segdef; segments_before={}",
+                            pos,
+                            self.segments.len()
+                        );
                     }
-                    self.parse_segdef(record_body)?;
-                    prev_was_data_record = false;
+                    #[cfg(debug_assertions)]
+                    {
+                        use core::fmt::Write as _;
+                        let mut s = String::new();
+                        let preview_len = core::cmp::min(record_body.len(), 24);
+                        for b in &record_body[..preview_len] {
+                            write!(&mut s, "{:02X} ", b).ok();
+                        }
+                        if record_body.len() > preview_len {
+                            write!(&mut s, "...").ok();
+                        }
+                        eprintln!("About to parse SEGDEF @0x{:X}: body_len={} body_preview={}", pos, record_body.len(), s);
+                    }
+                    let is_32 = record_type == omf::RT_SEGDEF32;
+                    self.parse_segdef(record_body, is_32)?;
+                    #[cfg(debug_assertions)]
+                    {
+                        if let Some(seg) = self.segments.last() {
+                            let idx = seg.ordinal;
+                            let total = self.segments.len();
+                            let name_idx = if seg.name_idx == u16::MAX { None } else { Some(seg.name_idx) };
+                            let class_idx = if seg.class_idx == u16::MAX { None } else { Some(seg.class_idx) };
+                            eprintln!("SEGDEF parsed @0x{:X}: new_ordinal={} total_segments={} name_idx={:?} class_idx={:?} length=0x{:X}", pos, idx, total, name_idx, class_idx, seg.length);
+                        } else {
+                            eprintln!("SEGDEF parsed @0x{:X}: no segment recorded (unexpected)", pos);
+                        }
+                    }
+                    last_data_target = None;
                 }
                 omf::RT_GRPDEF => {
-                    if prev_was_data_record {
-                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
+                    #[cfg(debug_assertions)]
+                    {
+                        // Debug: preview the GRPDEF body and decoded group name index
+                        use core::fmt::Write as _;
+                        let mut s = String::new();
+                        let preview_len = core::cmp::min(record_body.len(), 32);
+                        for b in &record_body[..preview_len] {
+                            write!(&mut s, "{:02X} ", b).ok();
+                        }
+                        if record_body.len() > preview_len {
+                            write!(&mut s, "...").ok();
+                        }
+                        if let Some((idx, c)) = omf::read_index(record_body, 0) {
+                            eprintln!(
+                                "About to parse GRPDEF @0x{:X}: body_len={} name_idx_preview={} encoded_len={} body_preview={}",
+                                pos,
+                                record_body.len(),
+                                idx,
+                                c,
+                                s
+                            );
+                        } else {
+                            eprintln!(
+                                "About to parse GRPDEF @0x{:X}: body_len={} name_idx_preview=<invalid> body_preview={}",
+                                pos,
+                                record_body.len(),
+                                s
+                            );
+                        }
                     }
                     self.parse_grpdef(record_body)?;
-                    prev_was_data_record = false;
+                    last_data_target = None;
                 }
+                // Other record types fall through below; we will print a per
+                // record summary after dispatch when is_post_0x3d is true.
                 omf::RT_EXTDEF | omf::RT_LOCAL_EXTDEF => {
-                    if prev_was_data_record {
-                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
-                    }
                     let is_local = record_type == omf::RT_LOCAL_EXTDEF;
                     self.parse_extdef(record_body, is_local)?;
-                    prev_was_data_record = false;
+                    last_data_target = None;
                 }
                 omf::RT_TYPDEF => {
-                    if prev_was_data_record {
-                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
-                    }
                     self.parse_typdef(record_body)?;
-                    prev_was_data_record = false;
+                    last_data_target = None;
                 }
                 omf::RT_PUBDEF | omf::RT_LOCAL_PUBDEF => {
-                    if prev_was_data_record {
-                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
-                    }
                     let is_local = record_type == omf::RT_LOCAL_PUBDEF;
                     self.parse_pubdef(record_body, is_local)?;
-                    prev_was_data_record = false;
+                    last_data_target = None;
                 }
                 omf::RT_LINNUM => {
-                    if prev_was_data_record {
-                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
-                    }
                     self.parse_linnum(record_body)?;
-                    prev_was_data_record = false;
+                    last_data_target = None;
                 }
                 omf::RT_COMDEF => {
-                    if prev_was_data_record {
-                        return Err(Error("FIXUPP record must follow LEDATA/LIDATA"));
-                    }
                     self.parse_comdef(record_body)?;
-                    prev_was_data_record = false;
+                    last_data_target = None;
                 }
-                omf::RT_LEDATA => {
+                omf::RT_LEDATA | omf::RT_LEDATA32 => {
                     #[cfg(debug_assertions)]
                     {
                         // Dump the raw 0xA0 record body preview before attempting
@@ -233,10 +278,10 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                             eprintln!("About to parse LEDATA @0x{:X}: unable to decode index preview", pos);
                         }
                     }
-                    let (target, off) = self.parse_ledata(record_body)?;
+                    let is_32 = record_type == omf::RT_LEDATA32;
+                    let (target, off) = self.parse_ledata(record_body, is_32)?;
                     last_data_target = Some(target);
-                    last_data_seg_offset = off;
-                    prev_was_data_record = true;
+                    last_data_seg_offset = off as u32;
                 }
                 omf::RT_LIDATA => {
                     #[cfg(debug_assertions)]
@@ -255,8 +300,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     }
                     let (target, off) = self.parse_lidata(record_body)?;
                     last_data_target = Some(target);
-                    last_data_seg_offset = off;
-                    prev_was_data_record = true;
+                    last_data_seg_offset = off as u32;
                 }
                 omf::RT_FIXUPP | omf::RT_FIXUPP32 => {
                     self.parse_fixupp(
@@ -266,10 +310,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                         &mut thread_table,
                         record_type == omf::RT_FIXUPP32,
                     )?;
-                    // A FIXUPP record consumes the "immediately follows" slot;
-                    // anything after it (until the next LEDATA/LIDATA) is no
-                    // longer adjacent to data.
-                    prev_was_data_record = false;
+                    last_data_target = None;
                 }
                 omf::RT_MODEND | omf::RT_MODEND32 => {
                     // MODEND (0x8A) and MODEND32 (0x8B) differ only in the
@@ -282,21 +323,106 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     break;
                 }
                 omf::RT_COMENT => {
-                    // COMENT cannot appear between a FIXUPP record and the
-                    // LEDATA/LIDATA it refers to.
-                    if prev_was_data_record {
-                        return Err(Error(
-                            "COMENT record cannot appear between LEDATA/LIDATA and its FIXUPP",
-                        ));
+                    #[cfg(debug_assertions)]
+                    {
+                        use core::fmt::Write as _;
+                        let mut s = String::new();
+                        let preview_len = core::cmp::min(record_body.len(), 24);
+                        for b in &record_body[..preview_len] {
+                            write!(&mut s, "{:02X} ", b).ok();
+                        }
+                        if record_body.len() > preview_len {
+                            write!(&mut s, "...").ok();
+                        }
+                        eprintln!(
+                            "COMENT @0x{:X}: body_len={} body_preview={} segments_before={}",
+                            pos,
+                            record_body.len(),
+                            s,
+                            self.segments.len()
+                        );
                     }
-                    self.parse_coment(record_body)?;
-                    prev_was_data_record = false;
+
+                    // Try Borland-variant SEGDEF interpretation first. Record
+                    // the segments.len() before/after to diagnose why some
+                    // 0x88 records do not materialize into ParsedSegment.
+                    // Borland variants always use 16-bit SEGDEF (0x98) layout.
+                    let segs_before = self.segments.len();
+                    let parsed_as_seg = match self.parse_segdef(record_body, false) {
+                        Ok(()) => true,
+                        Err(_) => false,
+                    };
+
+                    #[cfg(debug_assertions)]
+                    {
+                        if parsed_as_seg {
+                            eprintln!(
+                                "COMENT @0x{:X}: interpreted as SEGDEF (Borland variant) -> segments_after={} (+{})",
+                                pos,
+                                self.segments.len(),
+                                self.segments.len().saturating_sub(segs_before)
+                            );
+                        } else {
+                            eprintln!(
+                                "COMENT @0x{:X}: not a SEGDEF; falling back to normal COMENT parsing; segments_after={} (no change)",
+                                pos,
+                                self.segments.len()
+                            );
+                        }
+                    }
+
+                    if !parsed_as_seg {
+                        // Not a SEGDEF; parse as a normal comment.
+                        self.parse_coment(record_body)?;
+                    }
+
+                    last_data_target = None;
                 }
                 _ => {
+                    #[cfg(debug_assertions)]
+                    {
+                        let dump_len = record_body.len().min(16);
+                        use core::fmt::Write as _;
+                        let mut s = String::new();
+                        for b in &record_body[..dump_len] {
+                            write!(&mut s, "{:02X} ", b).ok();
+                        }
+                        if record_body.len() > dump_len {
+                            write!(&mut s, "...").ok();
+                        }
+                        eprintln!(
+                            "UNRECOGNIZED RECORD @0x{:X}: type=0x{:02X} len={} (branch: default) body_preview={}",
+                            pos, record_type, record_body.len(), s
+                        );
+                    }
                     // B5H / B7H (32-bit LEXTDEF / LPUBDEF) and other unknown records
                     // are silently skipped. Most 32-bit OMF variants are out of scope
                     // for this OMF16 parser.
-                    prev_was_data_record = false;
+                    last_data_target = None;
+                }
+            }
+
+            if is_post_0x3d {
+                #[cfg(debug_assertions)]
+                {
+                    use core::fmt::Write as _;
+                    let mut s = String::new();
+                    let preview_len = core::cmp::min(record_body.len(), 16);
+                    for b in &record_body[..preview_len] {
+                        write!(&mut s, "{:02X} ", b).ok();
+                    }
+                    if record_body.len() > preview_len {
+                        write!(&mut s, "...").ok();
+                    }
+                    eprintln!(
+                        "POST-0x3D RECORD @0x{:X}: type=0x{:02X} len={} body_first={:?} body_preview={} segments_now={}",
+                        pos,
+                        record_type,
+                        record_body.len(),
+                        record_body.get(0).copied(),
+                        s,
+                        self.segments.len()
+                    );
                 }
             }
 
@@ -324,6 +450,25 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
             let eff_len = if seg.big { 0x10000 } else { seg.length as u64 };
             seg.data.resize(eff_len as usize, 0);
+        }
+
+        // Resolution pass: build a resolved view of group members. For each
+        // group member ordinal record whether the referenced segment was
+        // materialized by parse time. Consumers (MODEND, FIXUPP) should use
+        // this resolved_members view rather than assuming members are always
+        // present.
+        for grp in &mut self.groups {
+            grp.resolved_members = grp
+                .members
+                .iter()
+                .map(|&ord| {
+                    if ord != 0 && (ord as usize) <= self.segments.len() {
+                        Some(ord)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         }
     }
 
@@ -373,7 +518,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         Ok(())
     }
 
-    fn parse_segdef(&mut self, body: &'data [u8]) -> Result<()> {
+    fn parse_segdef(&mut self, body: &'data [u8], is_32bit: bool) -> Result<()> {
         if body.is_empty() {
             return Err(Error("truncated SEGDEF"));
         }
@@ -392,11 +537,27 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             pos += 3; // skips 2 (frame) + 1 (offset, ignored by LINK)
         }
 
-        if pos + 2 > body.len() {
-            return Err(Error("truncated SEGDEF length"));
-        }
-        let length = u16::from_le_bytes([body[pos], body[pos + 1]]);
-        pos += 2;
+        let length = if is_32bit {
+            if pos + 4 > body.len() {
+                return Err(Error("truncated SEGDEF32 length"));
+            }
+            let l = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+            pos += 4;
+            if b_bit && l != 0 {
+                return Err(Error("SEGDEF32 B bit set but length field non-zero"));
+            }
+            l
+        } else {
+            if pos + 2 > body.len() {
+                return Err(Error("truncated SEGDEF length"));
+            }
+            let l = u16::from_le_bytes([body[pos], body[pos + 1]]) as u32;
+            pos += 2;
+            if b_bit && l != 0 {
+                return Err(Error("SEGDEF B bit set but length field non-zero"));
+            }
+            l
+        };
 
         let (seg_name_idx, c) = omf::read_index(body, pos).read_error("truncated SEGDEF name")?;
         pos += c;
@@ -466,36 +627,183 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         Ok(())
     }
 
+    /// Heuristic-only probe to check whether `body` could be a SEGDEF
+    /// without mutating parser state. Returns Ok(()) when the body has the
+    /// minimal structural shape of a SEGDEF; Err(reason) when truncated or
+    /// clearly not a SEGDEF. This is used only for debug diagnostics.
+    fn probe_segdef_shape(&self, body: &[u8]) -> core::result::Result<(), &'static str> {
+        if body.is_empty() {
+            return Err("empty");
+        }
+        let acbp = body[0];
+        let a_field = (acbp & omf::ACBP_A_MASK) >> omf::ACBP_A_SHIFT;
+        let mut pos = 1usize;
+
+        if a_field == omf::ALIGN_ABSOLUTE {
+            if pos + 3 > body.len() {
+                return Err("truncated absolute frame fields");
+            }
+            pos += 3;
+        }
+
+        if pos + 2 > body.len() {
+            return Err("truncated length");
+        }
+        pos += 2; // length
+
+        // name index
+        if omf::read_index(body, pos).is_none() {
+            return Err("truncated name index");
+        }
+        let (_, c) = omf::read_index(body, pos).unwrap();
+        pos += c;
+
+        // class index
+        if omf::read_index(body, pos).is_none() {
+            return Err("truncated class index");
+        }
+        let (_, c2) = omf::read_index(body, pos).unwrap();
+        pos += c2;
+
+        // overlay index
+        if omf::read_index(body, pos).is_none() {
+            return Err("truncated overlay index");
+        }
+        let (_, c3) = omf::read_index(body, pos).unwrap();
+        pos += c3;
+
+        if pos != body.len() {
+            return Err("trailing bytes");
+        }
+        Ok(())
+    }
+
     fn parse_grpdef(&mut self, body: &'data [u8]) -> Result<()> {
         let (name_idx, mut pos) = omf::read_index(body, 0).read_error("truncated GRPDEF name")?;
 
         if name_idx == 0 || name_idx as usize > self.lnames.len() {
             return Err(Error("GRPDEF name index out of range"));
         }
-
         let mut members = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut components = Vec::new();
+
         while pos < body.len() {
-            // Consume the type byte. Per spec, LINK ignores its value (only 0xFF
-            // is officially "segment index", but other Intel-defined types
-            // 0xFE/0xFD/0xFB/0xFA are treated the same way by LINK).
-            let _component_type = *body.get(pos).read_error("truncated GRPDEF component")?;
+            let component_type = *body.get(pos).read_error("truncated GRPDEF component type")?;
             pos += 1;
 
-            let (seg_idx, c) = omf::read_index(body, pos).read_error("truncated GRPDEF member")?;
-            pos += c;
-            if seg_idx == 0 || seg_idx as usize > self.segments.len() {
-                return Err(Error("GRPDEF segment index out of range"));
+            match component_type {
+                0xFF => {
+                    let (seg_idx, c) = omf::read_index(body, pos)
+                        .read_error("truncated GRPDEF segment component")?;
+                    pos += c;
+
+                    if seg_idx == 0 {
+                        // Zero is not a valid segment ordinal; record as unresolved
+                        // but do not fail the entire parse.
+                        #[cfg(debug_assertions)]
+                        eprintln!("GRPDEF: segment reference 0 at cursor {} (ignored)", pos - c);
+                        unresolved.push(seg_idx);
+                    } else if seg_idx as usize > self.segments.len() {
+                        // Not yet materialized: record the ordinal but don't fail.
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "GRPDEF: unresolved segment ordinal {} at cursor {} (available={})",
+                            seg_idx,
+                            pos - c,
+                            self.segments.len()
+                        );
+                        members.push(seg_idx);
+                        unresolved.push(seg_idx);
+                        components.push(crate::read::omf::ParsedGroupComponent::Segment { seg_index: seg_idx });
+                    } else {
+                        members.push(seg_idx);
+                        components.push(crate::read::omf::ParsedGroupComponent::Segment { seg_index: seg_idx });
+                    }
+                }
+
+                0xFE => {
+                    let (ext_idx, c) = omf::read_index(body, pos)
+                        .read_error("truncated GRPDEF external component")?;
+                    pos += c;
+                    components.push(crate::read::omf::ParsedGroupComponent::External { ext_index: ext_idx });
+                }
+
+                0xFD => {
+                    let (seg_name_index, c1) = omf::read_index(body, pos)
+                        .read_error("truncated GRPDEF name-triple seg name")?;
+                    pos += c1;
+                    let (class_name_index, c2) = omf::read_index(body, pos)
+                        .read_error("truncated GRPDEF name-triple class name")?;
+                    pos += c2;
+                    let (overlay_name_index, c3) = omf::read_index(body, pos)
+                        .read_error("truncated GRPDEF name-triple overlay name")?;
+                    pos += c3;
+
+                    components.push(crate::read::omf::ParsedGroupComponent::NameTriple {
+                        seg_name_index,
+                        class_name_index,
+                        overlay_name_index,
+                    });
+                }
+
+                0xFB => {
+                    if pos + 5 > body.len() {
+                        return Err(Error("truncated GRPDEF LTL component"));
+                    }
+
+                    let ltl_data = body[pos];
+                    let max_group_length = u16::from_le_bytes([body[pos + 1], body[pos + 2]]);
+                    let group_length = u16::from_le_bytes([body[pos + 3], body[pos + 4]]);
+                    pos += 5;
+
+                    components.push(crate::read::omf::ParsedGroupComponent::Ltl {
+                        ltl_data,
+                        max_group_length,
+                        group_length,
+                    });
+                }
+
+                0xFA => {
+                    if pos + 4 > body.len() {
+                        return Err(Error("truncated GRPDEF absolute-frame component"));
+                    }
+
+                    let frame_number = u16::from_le_bytes([body[pos], body[pos + 1]]);
+                    let offset = u16::from_le_bytes([body[pos + 2], body[pos + 3]]);
+                    pos += 4;
+
+                    components.push(crate::read::omf::ParsedGroupComponent::AbsoluteFrame {
+                        frame_number,
+                        offset,
+                    });
+                }
+
+                _ => {
+                    #[cfg(debug_assertions)]
+                    {
+                        eprintln!(
+                            "GRPDEF: unsupported component type 0x{:02X} at cursor {} (body_len={})",
+                            component_type,
+                            pos - 1,
+                            body.len()
+                        );
+                    }
+                    return Err(Error("unsupported GRPDEF component type"));
+                }
             }
-            members.push(seg_idx);
         }
 
-        if self.groups.len() >= 21 {
-            return Err(Error("GRPDEF count exceeds LINK limit of 21"));
+        if self.groups.len() >= 31 {
+            return Err(Error("GRPDEF count exceeds LINK limit of 31"));
         }
 
         self.groups.push(ParsedGroup {
             name_idx: name_idx - 1,
             members,
+            unresolved,
+            components,
+            resolved_members: Vec::new(),
         });
 
         Ok(())
@@ -693,14 +1001,23 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         Ok(())
     }
 
-    fn parse_ledata(&mut self, body: &[u8]) -> Result<(DataTarget, u16)> {
+    fn parse_ledata(&mut self, body: &[u8], is_32bit: bool) -> Result<(DataTarget, u32)> {
         let (seg_idx, c) = omf::read_index(body, 0).read_error("truncated LEDATA segment")?;
 
-        if c + 2 > body.len() {
-            return Err(Error("truncated LEDATA offset"));
-        }
-        let data_offset = u16::from_le_bytes([body[c], body[c + 1]]) as usize;
-        let data_bytes = &body[c + 2..];
+        let data_offset = if is_32bit {
+            if c + 4 > body.len() {
+                return Err(Error("truncated LEDATA32 offset"));
+            }
+            let off = u32::from_le_bytes([body[c], body[c + 1], body[c + 2], body[c + 3]]) as usize;
+            off
+        } else {
+            if c + 2 > body.len() {
+                return Err(Error("truncated LEDATA offset"));
+            }
+            u16::from_le_bytes([body[c], body[c + 1]]) as usize
+        };
+        let offset_field_bytes: usize = if is_32bit { 4 } else { 2 };
+        let data_bytes = &body[c + offset_field_bytes..];
 
         // Spec limit: data field max 1024 bytes.
         if data_bytes.len() > 1024 {
@@ -804,7 +1121,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     seg.data.resize(required, 0);
                 }
                 seg.data[data_offset..required].copy_from_slice(data_bytes);
-                return Ok((DataTarget::Segment(ord), data_offset as u16));
+                return Ok((DataTarget::Segment(ord), data_offset as u32));
             }
             DataTarget::Communal { comdef_ord } => {
                 // communal target: write into the comdef buffer
@@ -835,7 +1152,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                             data_bytes.len(),
                             req
                         );
-                        return Ok((DataTarget::Communal { comdef_ord: ordinal }, data_offset as u16));
+                        return Ok((DataTarget::Communal { comdef_ord: ordinal }, data_offset as u32));
                     }
                 }
                 return Err(Error("LEDATA segment index out of range"));
@@ -844,7 +1161,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         }
     }
 
-    fn parse_lidata(&mut self, body: &[u8]) -> Result<(DataTarget, u16)> {
+    fn parse_lidata(&mut self, body: &[u8]) -> Result<(DataTarget, u32)> {
         let (seg_idx, c) = omf::read_index(body, 0).read_error("truncated LIDATA segment")?;
         // Allow seg_idx==0 to be handled by resolution logic below; do not
         // early-return here so communal (COMDEF) mapping can be attempted.
@@ -932,7 +1249,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     seg.data.resize(required, 0);
                 }
                 seg.data[data_offset..required].copy_from_slice(&expanded);
-                return Ok((DataTarget::Segment(ord), data_offset as u16));
+                return Ok((DataTarget::Segment(ord), data_offset as u32));
             }
             DataTarget::Communal { comdef_ord } => {
                 let ordinal = comdef_ord;
@@ -962,7 +1279,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                             expanded.len(),
                             req
                         );
-                        return Ok((DataTarget::Communal { comdef_ord: ordinal }, data_offset as u16));
+                        return Ok((DataTarget::Communal { comdef_ord: ordinal }, data_offset as u32));
                     }
                 }
                 return Err(Error("LIDATA segment index out of range"));
@@ -975,7 +1292,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         &mut self,
         body: &[u8],
         last_data_target: Option<DataTarget>,
-        ledata_offset: u16,
+        ledata_offset: u32,
         thread_table: &mut ThreadTable,
         is_32bit: bool,
     ) -> Result<()> {
@@ -1046,8 +1363,10 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 }
                 pos = sub_pos;
 
+                let full_offset = ledata_offset + rec_offset as u32;
+
                 subrecords.push(ParsedFixuppSubrecord::Fixup(ParsedFixupSubrecord {
-                    record_offset: ledata_offset + rec_offset,
+                    record_offset: full_offset,
                     loc_raw,
                     loc,
                     is_seg_rel,
@@ -1080,7 +1399,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                             }
                             let seg = &mut self.segments[*seg_ordinal as usize - 1];
                             seg.relocs.push(ParsedReloc {
-                                offset: ledata_offset + rec_offset,
+                                offset: full_offset,
                                 loc,
                                 is_seg_rel,
                                 target: reloc_target.clone(),
@@ -1103,7 +1422,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                                 if comdat_pos < self.comdefs.len() {
                                     let comdef = &mut self.comdefs[comdat_pos];
                                     comdef.relocs.push(ParsedReloc {
-                                        offset: ledata_offset + rec_offset,
+                                        offset: full_offset,
                                         loc,
                                         is_seg_rel,
                                         target: reloc_target.clone(),
@@ -1114,7 +1433,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                                         "FIXUPP -> COMDEF: comdef_idx={} sym_index={} offset={} loc={} target={:?}",
                                         comdat_pos + 1,
                                         sym_index.0,
-                                        ledata_offset + rec_offset,
+                                        full_offset,
                                         loc,
                                         reloc_target
                                     );
@@ -1213,17 +1532,26 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         // semantics used elsewhere in the parser.
         self.entry = match target.method {
             0 | 4 => EntryPoint::Segment(target.datum.unwrap_or(0), displacement as u32),
-            1 | 5 => {
+                1 | 5 => {
                 let grp = self
                     .groups
                     .get(target.datum.unwrap_or(0) as usize - 1)
                     .ok_or(Error("MODEND group index out of range"))?;
-                let seg = grp
-                    .members
-                    .first()
-                    .copied()
-                    .ok_or(Error("MODEND group has no member segments"))?;
-                EntryPoint::Segment(seg, displacement as u32)
+                // Prefer the resolved_members view populated during finalize().
+                // If the resolved view is absent or the first member is None,
+                // conservatively treat the module as having no entry point
+                // rather than inventing an address from an unresolved ordinal.
+                if grp.resolved_members.is_empty() {
+                    return Err(Error("MODEND group resolution not available"));
+                }
+                match grp.resolved_members.first().copied().flatten() {
+                    Some(seg) => EntryPoint::Segment(seg, displacement as u32),
+                    None => {
+                        #[cfg(debug_assertions)]
+                        eprintln!("MODEND: group {} first member unresolved; returning no entry", target.datum.unwrap_or(0));
+                        EntryPoint::None
+                    }
+                }
             }
             2 | 6 => {
                 EntryPoint::External(target.datum.unwrap_or(0), displacement as u32)
