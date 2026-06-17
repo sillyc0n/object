@@ -631,53 +631,6 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     /// without mutating parser state. Returns Ok(()) when the body has the
     /// minimal structural shape of a SEGDEF; Err(reason) when truncated or
     /// clearly not a SEGDEF. This is used only for debug diagnostics.
-    fn probe_segdef_shape(&self, body: &[u8]) -> core::result::Result<(), &'static str> {
-        if body.is_empty() {
-            return Err("empty");
-        }
-        let acbp = body[0];
-        let a_field = (acbp & omf::ACBP_A_MASK) >> omf::ACBP_A_SHIFT;
-        let mut pos = 1usize;
-
-        if a_field == omf::ALIGN_ABSOLUTE {
-            if pos + 3 > body.len() {
-                return Err("truncated absolute frame fields");
-            }
-            pos += 3;
-        }
-
-        if pos + 2 > body.len() {
-            return Err("truncated length");
-        }
-        pos += 2; // length
-
-        // name index
-        if omf::read_index(body, pos).is_none() {
-            return Err("truncated name index");
-        }
-        let (_, c) = omf::read_index(body, pos).unwrap();
-        pos += c;
-
-        // class index
-        if omf::read_index(body, pos).is_none() {
-            return Err("truncated class index");
-        }
-        let (_, c2) = omf::read_index(body, pos).unwrap();
-        pos += c2;
-
-        // overlay index
-        if omf::read_index(body, pos).is_none() {
-            return Err("truncated overlay index");
-        }
-        let (_, c3) = omf::read_index(body, pos).unwrap();
-        pos += c3;
-
-        if pos != body.len() {
-            return Err("trailing bytes");
-        }
-        Ok(())
-    }
-
     fn parse_grpdef(&mut self, body: &'data [u8]) -> Result<()> {
         let (name_idx, mut pos) = omf::read_index(body, 0).read_error("truncated GRPDEF name")?;
 
