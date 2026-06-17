@@ -162,6 +162,46 @@ pub struct ParsedSymbol<'data> {
     pub offset: u16,
 }
 
+/// A parsed TYPDEF record (obsolete compatibility record).
+#[derive(Debug, Clone)]
+pub struct ParsedTypDefRecord<'data> {
+    /// The optional name (count-prefixed string from the record).
+    pub name: &'data [u8],
+    /// EN field from the record (not always present; 0 when absent).
+    pub en: u8,
+    /// The decoded descriptor.
+    pub descriptor: ParsedTypDefDescriptor<'data>,
+}
+
+// Variable kinds supported by NEAR descriptors are encoded as a single byte in
+// the record. We store the raw byte here to preserve on-disk fidelity; this
+// keeps the parser tolerant of tool-specific values while still exposing the
+// common cases for callers.
+
+/// TYPDEF descriptor decoded from the leaf-stream. Unknown leaf tags are
+/// captured as opaques to preserve compatibility with tool-specific
+/// extensions.
+#[derive(Debug, Clone)]
+pub enum ParsedTypDefDescriptor<'data> {
+    /// NEAR variable: (variable_type_byte, length_bits)
+    /// NEAR variable: (variable_type_byte, length_bits)
+    Near {
+        /// The raw variable type byte (e.g. 0x77 for array).
+        variable_type: u8,
+        /// The bit length of the variable.
+        length_bits: u32,
+    },
+    /// FAR variable: (element_count, element_type_index)
+    Far {
+        /// Number of elements in the FAR array.
+        element_count: u32,
+        /// Index into the TYPDEF list for the element type (1-based).
+        element_type_index: u16,
+    },
+    /// Unknown/opaque leafs — the raw remaining bytes of the descriptor.
+    Opaque(&'data [u8]),
+}
+
 /// The kind of a parsed OMF symbol.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ParsedSymbolKind {

@@ -24,6 +24,8 @@ use super::*;
     pub groups: Vec<ParsedGroup>,
     /// The symbol list of the file.
     pub symbols: Vec<ParsedSymbol<'data>>,
+    /// Parsed TYPDEF records (obsolete compatibility records).
+    pub typdefs: Vec<ParsedTypDefRecord<'data>>,
     /// Decoded FIXUPP records for dump purposes.
     fixupp_records: Vec<ParsedFixuppRecord>,
     pub(super) extdef_symbol_indices: Vec<SymbolIndex>,
@@ -49,6 +51,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             segments: Vec::new(),
             groups: Vec::new(),
             symbols: Vec::new(),
+            typdefs: Vec::new(),
             fixupp_records: Vec::new(),
             extdef_symbol_indices: Vec::new(),
             entry: EntryPoint::None,
@@ -428,16 +431,37 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     fn parse_typdef(&mut self, body: &'data [u8]) -> Result<()> {
         let mut pos = 0;
 
-        // The name field is always a single null byte (p.665).
+        // Old OMF TYPDEF format: a single null name byte followed by a
+        // sequence of leaf descriptors. For compatibility we accept a
+        // zero-length count-prefix (0x00) as the name, but continue to parse
+        // leafs like the original implementation.
         if pos >= body.len() {
-            return Err(Error("truncated TYPDEF name"));
+            return Err(Error("truncated TYPDEF body"));
         }
-        if body[pos] != 0x00 {
-            return Err(Error("TYPDEF name field must be null"));
-        }
-        pos += 1;
 
-        // Parse the eight-leaf descriptor: a sequence of leaf descriptors.
+        // The historical parser used a single null byte for the name. Newer
+        // toolings sometimes use count-prefixed names; accept both by peeking
+        // at the first byte. If it's zero, treat it as an empty name and
+        // advance by 1 (legacy); otherwise treat it as a count-prefixed
+        // name.
+        let (name, consumed) = if body[pos] == 0 {
+            (&body[pos + 1..pos + 1], 1)
+        } else {
+            omf::read_name(body, pos).read_error("truncated TYPDEF name")?
+        };
+        pos += consumed;
+
+        // EN field is optional in older encodings; if present (enforced by
+        // length) read it, otherwise default to 0.
+        let en = if pos < body.len() { *body.get(pos).unwrap() } else { 0 };
+        if pos < body.len() {
+            pos += 1;
+        }
+
+        // Parse leaf descriptors until the end of the record. We preserve
+        // unknown leaf tags by storing opaque remainder when we cannot
+        // interpret a leaf; this mirrors the previous tolerant behavior.
+        let mut descriptor: Option<ParsedTypDefDescriptor<'data>> = None;
         while pos < body.len() {
             let tag = body[pos];
             pos += 1;
@@ -445,40 +469,50 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             match tag {
                 0x62 => {
                     // NEAR variable: 62H variable_type length_in_bits
-                    if pos >= body.len() {
-                        return Err(Error("truncated TYPDEF NEAR variable type"));
-                    }
-                    let _variable_type = body[pos]; // 77H/79H/7BH, ignored by LINK
+                    let variable_type = *body.get(pos).read_error("truncated TYPDEF NEAR variable type")?;
                     pos += 1;
-
-                    let (_length_in_bits, c) = omf::read_varlen(body, pos)
+                    let (length_bits, c) = omf::read_varlen(body, pos)
                         .read_error("truncated TYPDEF length_in_bits")?;
                     pos += c;
+                    descriptor = Some(ParsedTypDefDescriptor::Near { variable_type, length_bits });
                 }
                 0x61 => {
                     // FAR variable: 61H variable_type number_of_elements element_type_index
-                    if pos >= body.len() {
-                        return Err(Error("truncated TYPDEF FAR variable type"));
-                    }
-                    let _variable_type = body[pos]; // restricted to 77H (array)
+                    let _variable_type = *body.get(pos).read_error("truncated TYPDEF FAR variable type")?;
                     pos += 1;
-
-                    let (_number_of_elements, c) = omf::read_varlen(body, pos)
+                    let (number_of_elements, c) = omf::read_varlen(body, pos)
                         .read_error("truncated TYPDEF number_of_elements")?;
                     pos += c;
-
-                    let (_element_type_index, c) = omf::read_index(body, pos)
+                    let (element_type_index, c) = omf::read_index(body, pos)
                         .read_error("truncated TYPDEF element_type_index")?;
                     pos += c;
+
+                    // Validate referenced index if present in already-parsed typdefs.
+                    if element_type_index != 0 && element_type_index as usize <= self.typdefs.len() {
+                        let referenced = &self.typdefs[element_type_index as usize - 1];
+                        match &referenced.descriptor {
+                            ParsedTypDefDescriptor::Near { .. } => {}
+                            _ => {
+                                // Keep tolerant: do not fail hard; just record opaque.
+                                descriptor = Some(ParsedTypDefDescriptor::Opaque(&[]));
+                                continue;
+                            }
+                        }
+                    }
+
+                    descriptor = Some(ParsedTypDefDescriptor::Far { element_count: number_of_elements, element_type_index });
                 }
+                // Unknown leaf tag: store remaining bytes as opaque and stop.
                 _ => {
-                    // Unknown leaf descriptor tag — skip remaining leaves in this
-                    // TYPDEF record, as tool-specific descriptors may be present.
-                    // The OMF spec states linkers should ignore unrecognized tags.
+                    descriptor = Some(ParsedTypDefDescriptor::Opaque(&body[pos - 1..]));
                     break;
                 }
             }
         }
+
+        let descriptor = descriptor.unwrap_or(ParsedTypDefDescriptor::Opaque(&[]));
+
+        self.typdefs.push(ParsedTypDefRecord { name, en, descriptor });
 
         Ok(())
     }
@@ -917,6 +951,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     /// readers to expose format-native structures.
     pub fn raw_fixupp_records(&self) -> &[ParsedFixuppRecord] {
         &self.fixupp_records
+    }
+
+    /// Raw-format accessor: return the parsed TYPDEF records.
+    pub fn raw_typdefs(&self) -> &[crate::read::omf::ParsedTypDefRecord<'data>] {
+        &self.typdefs
     }
 
     /// Collect all THREAD subrecords from all FIXUPP records.

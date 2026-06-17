@@ -1153,6 +1153,49 @@ fn omf_fixupp_record_thread_table_snapshot() {
 }
 
 #[test]
+fn fixupp_thread_table_snapshot_and_checksum_diagnostic() {
+    // Build a minimal OMF object in bytes using the test helper make_record.
+    let mut bytes = Vec::new();
+
+    // THEADR: name length 0
+    bytes.extend(make_record(0x80, &[0x00]));
+
+    // SEGDEF: acbp=ALIGN_BYTE (use 0x28), length=4, name=0,class=0,overlay=0
+    bytes.extend(make_record(0x98, &[0x28, 0x04, 0x00, 0, 0, 0]));
+
+    // LEDATA: seg idx 1, offset 0, data 0xAA
+    bytes.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0xAA]));
+
+    // FIXUPP: THREAD (frame thread 0, method 1 with datum index 1) then fixup
+    // THREAD subrecord: is_frame (0x40) | method(1<<2) | thread 0 -> 0x44
+    // fixup locat: 0x84,0x00; fix_dat 0x80; target datum 1; disp 0x0000
+    bytes.extend(make_record(0x9C, &[0x44, 0x01, 0x84, 0x00, 0x80, 0x01, 0x00, 0x00]));
+
+    // MODEND simple
+    bytes.extend(make_record(0x8A, &[0x01]));
+
+    // Parse a clean module (no checksum corruption)
+    let file = OmfFile::parse(&bytes[..]).expect("parse failed");
+
+    // We should have one FIXUPP record and its saved thread table should reflect
+    // the state at the start (i.e., before the THREAD subrecord in this FIXUPP)
+    assert!(!file.fixupp_records().is_empty());
+    let rec = &file.fixupp_records()[0];
+    // The snapshot should have no threads defined at start (we started thread_table empty)
+    assert!(rec.thread_table.frame.iter().all(|t| t.is_none()));
+
+    // Now corrupt the LEDATA checksum and verify parsing still succeeds (checksum non-fatal).
+    let mut bad = bytes.clone();
+    let ledpos = bad.iter().position(|&b| b == 0xA0).unwrap();
+    let rec_len = u16::from_le_bytes([bad[ledpos + 1], bad[ledpos + 2]]) as usize;
+    let checksum_index = ledpos + 3 + rec_len - 1;
+    bad[checksum_index] = bad[checksum_index].wrapping_add(1);
+    // Checksum mismatches are non-fatal: parse should still succeed.
+    let obj = OmfFile::parse(&bad[..]).expect("parse should tolerate checksum mismatch");
+    assert_eq!(obj.module_name(), b"");
+}
+
+#[test]
 fn omf_entry_point_enum() {
     // Verify that entry point is accessible as the EntryPoint enum.
     let mut data = Vec::new();
