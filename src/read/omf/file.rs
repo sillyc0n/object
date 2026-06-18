@@ -52,6 +52,8 @@ enum DataTarget {
         pub(super) comdat_groups: Vec<(SymbolIndex, crate::read::ComdatKind)>,
     #[allow(unused)]
     pub(super) has_ms_ext: bool,
+    /// Parsed LINSYM (0xC4 / 0xC5) records.
+    pub(super) linsym_records: Vec<super::LinsymRecord>,
     pub(super) marker: PhantomData<&'data ()>,
 }
 
@@ -76,6 +78,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             entry: EntryPoint::None,
             comdat_groups: Vec::new(),
             has_ms_ext: false,
+            linsym_records: Vec::new(),
             marker: PhantomData,
         };
 
@@ -332,6 +335,14 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     self.comdat_records.push(comdat);
                     last_data_target = Some(DataTarget::Comdat { index: comdat_index });
                     last_data_seg_offset = 0;
+                }
+                omf::RT_LINSYM | omf::RT_LINSYM32 => {
+                    let name_encoding = super::PublicNameEncoding::MicrosoftIndex;
+                    let record_bytes = &data[pos..pos + 3 + record_length];
+                    let linsym = parse_linsym(record_bytes, name_encoding)
+                        .map_err(|_| Error("invalid LINSYM record"))?;
+                    self.linsym_records.push(linsym);
+                    last_data_target = None;
                 }
                 omf::RT_MODEND | omf::RT_MODEND32 => {
                     // MODEND (0x8A) and MODEND32 (0x8B) differ only in the
@@ -1810,6 +1821,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         &self.comdat_records
     }
 
+    /// Returns the parsed LINSYM (0xC4/0xC5) records.
+    pub fn linsym_records(&self) -> &[super::LinsymRecord] {
+        &self.linsym_records
+    }
+
     /// Collect all THREAD subrecords from all FIXUPP records.
     pub fn thread_subrecords(&self) -> Vec<&ParsedThreadSubrecord> {
         let mut threads = Vec::new();
@@ -2680,4 +2696,159 @@ impl<'a> LpubdefCursor<'a> {
             Ok(super::OmfIndex((((first & 0x7F) as u16) << 8) | second as u16))
         }
     }
+}
+
+// ── Standalone LINSYM parser (spec-level) ───────────────────────────────────
+
+/// Parse a LINSYM or LINSYM32 record from a raw byte slice.
+///
+/// `input` must begin with the `0xC4` or `0xC5` type byte and include all
+/// bytes through (and including) the trailing checksum byte:
+///
+///   [type:1][length:2][flags:1][public_name:1-2 or var]
+///   ([line_num:2][offset:2 or 4])* [checksum:1]
+///
+/// `name_encoding` selects between Microsoft LINK (OMF index) and IBM LINK386
+/// (length-prefixed string) interpretation of the Public Name field.
+pub fn parse_linsym(
+    input: &[u8],
+    name_encoding: super::PublicNameEncoding,
+) -> core::result::Result<super::LinsymRecord, super::LinsymError> {
+    let mut pos = 0usize;
+
+    let kind = match linsym_read_u8(input, &mut pos)? {
+        0xC4 => super::LinsymKind::Linsym16,
+        0xC5 => super::LinsymKind::Linsym32,
+        other => return Err(super::LinsymError::WrongRecordType { found: other }),
+    };
+
+    let record_length = linsym_read_u16_le(input, &mut pos)? as usize;
+    let record_end = pos + record_length;
+    if record_end > input.len() {
+        return Err(super::LinsymError::UnexpectedEof(input.len()));
+    }
+
+    linsym_verify_checksum(&input[..record_end])?;
+
+    let flags = linsym_parse_flags(input, &mut pos)?;
+    let public_name = linsym_parse_public_name(input, &mut pos, name_encoding)?;
+
+    let data_end = record_end - 1;
+    let entry_size = match kind {
+        super::LinsymKind::Linsym16 => 4,
+        super::LinsymKind::Linsym32 => 6,
+    };
+    let body_remaining = data_end.saturating_sub(pos);
+    if body_remaining % entry_size != 0 {
+        return Err(super::LinsymError::UnalignedBody {
+            body: body_remaining,
+            entry_size,
+        });
+    }
+
+    let mut entries = Vec::with_capacity(body_remaining / entry_size);
+    while pos < data_end {
+        let line_number = linsym_read_u16_le(input, &mut pos)?;
+        let offset = linsym_parse_line_offset(input, &mut pos, kind)?;
+        entries.push(super::LineEntry { line_number, offset });
+    }
+
+    Ok(super::LinsymRecord {
+        kind,
+        flags,
+        public_name,
+        entries,
+    })
+}
+
+fn linsym_read_u8(buf: &[u8], pos: &mut usize) -> core::result::Result<u8, super::LinsymError> {
+    buf.get(*pos).copied()
+        .map(|b| { *pos += 1; b })
+        .ok_or(super::LinsymError::UnexpectedEof(*pos))
+}
+
+fn linsym_read_u16_le(buf: &[u8], pos: &mut usize) -> core::result::Result<u16, super::LinsymError> {
+    let lo = linsym_read_u8(buf, pos)? as u16;
+    let hi = linsym_read_u8(buf, pos)? as u16;
+    Ok(lo | (hi << 8))
+}
+
+fn linsym_read_u32_le(buf: &[u8], pos: &mut usize) -> core::result::Result<u32, super::LinsymError> {
+    let b0 = linsym_read_u8(buf, pos)? as u32;
+    let b1 = linsym_read_u8(buf, pos)? as u32;
+    let b2 = linsym_read_u8(buf, pos)? as u32;
+    let b3 = linsym_read_u8(buf, pos)? as u32;
+    Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+}
+
+fn linsym_parse_index(buf: &[u8], pos: &mut usize) -> core::result::Result<u16, super::LinsymError> {
+    let b0 = linsym_read_u8(buf, pos)?;
+    if b0 & 0x80 == 0 {
+        Ok(b0 as u16)
+    } else {
+        let b1 = linsym_read_u8(buf, pos)?;
+        Ok((((b0 & 0x7F) as u16) << 8) | b1 as u16)
+    }
+}
+
+fn linsym_parse_flags(
+    buf: &[u8],
+    pos: &mut usize,
+) -> core::result::Result<super::LinsymFlags, super::LinsymError> {
+    let byte = linsym_read_u8(buf, pos)?;
+    Ok(super::LinsymFlags::from_bits_truncate(byte))
+}
+
+fn linsym_parse_public_name(
+    buf: &[u8],
+    pos: &mut usize,
+    encoding: super::PublicNameEncoding,
+) -> core::result::Result<super::PublicName, super::LinsymError> {
+    match encoding {
+        super::PublicNameEncoding::MicrosoftIndex => {
+            Ok(super::PublicName::Index(linsym_parse_index(buf, pos)?))
+        }
+        super::PublicNameEncoding::IbmString => {
+            let len = linsym_read_u8(buf, pos)? as usize;
+            if *pos + len > buf.len() {
+                return Err(super::LinsymError::UnexpectedEof(*pos));
+            }
+            let name = buf[*pos..*pos + len].to_vec();
+            *pos += len;
+            Ok(super::PublicName::Name(name))
+        }
+    }
+}
+
+fn linsym_parse_line_offset(
+    buf: &[u8],
+    pos: &mut usize,
+    kind: super::LinsymKind,
+) -> core::result::Result<u32, super::LinsymError> {
+    match kind {
+        super::LinsymKind::Linsym16 => linsym_read_u16_le(buf, pos).map(|v| v as u32),
+        super::LinsymKind::Linsym32 => linsym_read_u32_le(buf, pos),
+    }
+}
+
+fn linsym_verify_checksum(record_bytes: &[u8]) -> core::result::Result<(), super::LinsymError> {
+    let stored = match record_bytes.last() {
+        Some(&b) => b,
+        None => return Err(super::LinsymError::UnexpectedEof(0)),
+    };
+    if stored == 0x00 {
+        return Ok(());
+    }
+    let sum: u8 = record_bytes
+        .iter()
+        .fold(0u8, |acc, &b| acc.wrapping_add(b));
+    if sum != 0 {
+        let computed = 0u8.wrapping_sub(
+            record_bytes[..record_bytes.len() - 1]
+                .iter()
+                .fold(0u8, |acc, &b| acc.wrapping_add(b)),
+        );
+        return Err(super::LinsymError::ChecksumMismatch { computed, stored });
+    }
+    Ok(())
 }

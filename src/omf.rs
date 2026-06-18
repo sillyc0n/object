@@ -57,6 +57,10 @@ pub const RT_COMDEF: u8 = 0xB0;
 pub const RT_COMDAT: u8 = 0xC2;
 /// COMDAT32: 32-bit Communal Data Record (32-bit data offset).
 pub const RT_COMDAT32: u8 = 0xC3;
+/// LINSYM: Symbol Line Numbers Record (16-bit offset).
+pub const RT_LINSYM: u8 = 0xC4;
+/// LINSYM32: Symbol Line Numbers Record (32-bit offset).
+pub const RT_LINSYM32: u8 = 0xC5;
 
 // ── SEGDEF ACBP byte ──────────────────────────────────────────────────────
 //

@@ -2,6 +2,8 @@ use object::read::omf::{
     OmfFile, ThreadKind,
     parse_pubdef_record, PubdefRecord, PubdefKind, PubdefBase, PubdefEntry, PubdefError,
     parse_lpubdef, LpubdefParseError, OffsetWidth, OmfIndex,
+    parse_linsym, LinsymKind, LineEntry, LinsymError,
+    PublicName, PublicNameEncoding,
 };
 use object::{Architecture, BinaryFormat, Object, ObjectComdat, ObjectSection, ObjectSegment, ObjectSymbol, Permissions, RelocationTarget, SectionIndex, SectionKind, SymbolIndex};
 
@@ -2548,4 +2550,245 @@ fn omf_entry_point_enum() {
     let obj = OmfFile::parse(&data[..]).unwrap();
     // entry() still returns the flat address.
     assert_eq!(obj.entry(), 0x0123);
+}
+
+// ── LINSYM (0xC4 / 0xC5) tests ────────────────────────────────────────────
+
+#[test]
+fn omf_linsym_basic() {
+    // C4H integrated through OmfFile::parse.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    // flags=0x00, name_idx=0x02, 3 entries:
+    //   line=10 offset=0x0000  line=12 offset=0x0006  line=15 offset=0x000E
+    data.extend(make_record(0xC4, &[
+        0x00, 0x02,
+        0x0A, 0x00, 0x00, 0x00,
+        0x0C, 0x00, 0x06, 0x00,
+        0x0F, 0x00, 0x0E, 0x00,
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let linsyms = obj.linsym_records();
+    assert_eq!(linsyms.len(), 1);
+    let rec = &linsyms[0];
+    assert_eq!(rec.kind, LinsymKind::Linsym16);
+    assert!(!rec.flags.is_continuation());
+    assert_eq!(rec.public_name, PublicName::Index(2));
+    assert_eq!(rec.entries.len(), 3);
+    assert_eq!(rec.entries[0], LineEntry { line_number: 10, offset: 0 });
+    assert_eq!(rec.entries[1], LineEntry { line_number: 12, offset: 6 });
+    assert_eq!(rec.entries[2], LineEntry { line_number: 15, offset: 14 });
+}
+
+#[test]
+fn omf_linsym32_basic() {
+    // C5H integrated through OmfFile::parse with 32-bit offsets.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    // flags=0x00, name_idx=0x01, 2 entries with 32-bit offsets:
+    //   line=10 offset=0x00000100  line=20 offset=0x00010000
+    data.extend(make_record(0xC5, &[
+        0x00, 0x01,
+        0x0A, 0x00, 0x00, 0x01, 0x00, 0x00, // line=10, offset=0x100
+        0x14, 0x00, 0x00, 0x00, 0x01, 0x00, // line=20, offset=0x10000
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let linsyms = obj.linsym_records();
+    assert_eq!(linsyms.len(), 1);
+    let rec = &linsyms[0];
+    assert_eq!(rec.kind, LinsymKind::Linsym32);
+    assert!(!rec.flags.is_continuation());
+    assert_eq!(rec.public_name, PublicName::Index(1));
+    assert_eq!(rec.entries.len(), 2);
+    assert_eq!(rec.entries[0], LineEntry { line_number: 10, offset: 0x100 });
+    assert_eq!(rec.entries[1], LineEntry { line_number: 20, offset: 0x10000 });
+}
+
+#[test]
+fn omf_linsym_continuation() {
+    // Two C4H records: first new, second continuation.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    // Record 1: flags=0x00 (new), name_idx=0x03, 1 entry
+    data.extend(make_record(0xC4, &[0x00, 0x03, 0x0A, 0x00, 0x00, 0x00]));
+    // Record 2: flags=0x01 (continuation), name_idx=0x03, 1 entry
+    data.extend(make_record(0xC4, &[0x01, 0x03, 0x14, 0x00, 0x10, 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let linsyms = obj.linsym_records();
+    assert_eq!(linsyms.len(), 2);
+    assert!(!linsyms[0].flags.is_continuation());
+    assert_eq!(linsyms[0].entries[0], LineEntry { line_number: 10, offset: 0 });
+    assert!(linsyms[1].flags.is_continuation());
+    assert_eq!(linsyms[1].entries[0], LineEntry { line_number: 20, offset: 0x10 });
+}
+
+#[test]
+fn omf_linsym_zero_entries() {
+    // A record with no line entries (only flags + public name) is valid.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0xC4, &[0x00, 0x01]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let linsyms = obj.linsym_records();
+    assert_eq!(linsyms.len(), 1);
+    assert!(linsyms[0].entries.is_empty());
+}
+
+#[test]
+fn omf_linsym_multiple_records() {
+    // Two separate LINSYM records for different symbols.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0xC4, &[0x00, 0x01, 0x0A, 0x00, 0x00, 0x00]));
+    data.extend(make_record(0xC5, &[0x00, 0x02, 0x14, 0x00, 0x78, 0x56, 0x34, 0x12]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let linsyms = obj.linsym_records();
+    assert_eq!(linsyms.len(), 2);
+    assert_eq!(linsyms[0].kind, LinsymKind::Linsym16);
+    assert_eq!(linsyms[0].public_name, PublicName::Index(1));
+    assert_eq!(linsyms[1].kind, LinsymKind::Linsym32);
+    assert_eq!(linsyms[1].public_name, PublicName::Index(2));
+    assert_eq!(linsyms[1].entries[0], LineEntry { line_number: 20, offset: 0x12345678 });
+}
+
+// ── Standalone LINSYM parser tests (spec-level) ────────────────────────────
+
+#[test]
+fn omf_parse_linsym_c4_basic() {
+    let rec = make_record(0xC4, &[
+        0x00, 0x04,
+        0x0A, 0x00, 0x00, 0x00,
+        0x0C, 0x00, 0x06, 0x00,
+        0x0F, 0x00, 0x0E, 0x00,
+    ]);
+    let parsed = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap();
+    assert_eq!(parsed.kind, LinsymKind::Linsym16);
+    assert!(!parsed.flags.is_continuation());
+    assert_eq!(parsed.public_name, PublicName::Index(4));
+    assert_eq!(parsed.entries.len(), 3);
+    assert_eq!(parsed.entries[0], LineEntry { line_number: 10, offset: 0 });
+    assert_eq!(parsed.entries[1], LineEntry { line_number: 12, offset: 6 });
+    assert_eq!(parsed.entries[2], LineEntry { line_number: 15, offset: 14 });
+}
+
+#[test]
+fn omf_parse_linsym_c5_basic() {
+    let rec = make_record(0xC5, &[
+        0x00, 0x03,
+        0x0A, 0x00, 0x00, 0x01, 0x00, 0x00, // line=10, offset=0x100
+    ]);
+    let parsed = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap();
+    assert_eq!(parsed.kind, LinsymKind::Linsym32);
+    assert_eq!(parsed.public_name, PublicName::Index(3));
+    assert_eq!(parsed.entries[0], LineEntry { line_number: 10, offset: 0x100 });
+}
+
+#[test]
+fn omf_parse_linsym_wrong_type() {
+    let rec = make_record(0x90, &[0x00, 0x01]);
+    let err = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap_err();
+    assert_eq!(err, LinsymError::WrongRecordType { found: 0x90 });
+}
+
+#[test]
+fn omf_parse_linsym_checksum_mismatch() {
+    // Corrupt the checksum byte of an otherwise valid record.
+    let mut rec = make_record(0xC4, &[0x00, 0x01, 0x0A, 0x00, 0x00, 0x00]);
+    if let Some(last) = rec.last_mut() {
+        *last = last.wrapping_add(1);
+    }
+    let err = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap_err();
+    assert!(matches!(err, LinsymError::ChecksumMismatch { .. }));
+}
+
+#[test]
+fn omf_parse_linsym_checksum_zero_accepted() {
+    // A record with checksum 0x00 is valid (omitted checksum).
+    let mut rec = make_record(0xC4, &[0x00, 0x01, 0x0A, 0x00, 0x00, 0x00]);
+    let len = rec.len();
+    // Overwrite the computed checksum with 0x00 (which is incorrect, but 0x00
+    // should be accepted unconditionally per spec).
+    rec[len - 1] = 0x00;
+    let parsed = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap();
+    assert_eq!(parsed.entries.len(), 1);
+}
+
+#[test]
+fn omf_parse_linsym_unaligned_body() {
+    // Body after flags+name is not divisible by entry size (4 for C4H).
+    let rec = make_record(0xC4, &[0x00, 0x01, 0x0A, 0x00, 0x00]); // 3 bytes remaining
+    let err = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap_err();
+    assert!(matches!(err, LinsymError::UnalignedBody { body: 3, entry_size: 4 }));
+}
+
+#[test]
+fn omf_parse_linsym_unaligned_body_c5() {
+    // Body after flags+name is not divisible by 6 for C5H.
+    // Use a 2-byte public name index, then 3 bytes remaining.
+    let rec = make_record(0xC5, &[
+        0x00,             // flags=0
+        0x81, 0x01,       // name=0x0101 (2-byte index)
+        0x0A, 0x00, 0x00, // 3 bytes remaining; 3 % 6 = 3
+    ]);
+    let err = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap_err();
+    assert!(matches!(err, LinsymError::UnalignedBody { body: 3, entry_size: 6 }));
+}
+
+#[test]
+fn omf_parse_linsym_empty_body() {
+    // Only flags + public name, no entries, should succeed.
+    let rec = make_record(0xC4, &[0x00, 0x01]);
+    let parsed = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap();
+    assert_eq!(parsed.entries.len(), 0);
+}
+
+#[test]
+fn omf_parse_linsym_two_byte_index() {
+    // Public name encoded as a 2-byte OMF index.
+    let rec = make_record(0xC4, &[
+        0x00, 0x81, 0x2A, // flags=0, name=0x012A (2-byte)
+        0x0A, 0x00, 0x00, 0x00,
+    ]);
+    let parsed = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap();
+    assert_eq!(parsed.public_name, PublicName::Index(0x012A));
+    assert_eq!(parsed.entries[0], LineEntry { line_number: 10, offset: 0 });
+}
+
+#[test]
+fn omf_parse_linsym_ibm_string_encoding() {
+    // IBM LINK386 encoding: length-prefixed string.
+    let rec = make_record(0xC4, &[
+        0x00,                // flags=0
+        0x03, b'f', b'o', b'o', // name_len=3 "foo"
+        0x0A, 0x00, 0x00, 0x00, // line=10, offset=0
+    ]);
+    let parsed = parse_linsym(&rec, PublicNameEncoding::IbmString).unwrap();
+    assert_eq!(parsed.public_name, PublicName::Name(b"foo".to_vec()));
+    assert_eq!(parsed.entries[0], LineEntry { line_number: 10, offset: 0 });
+}
+
+#[test]
+fn omf_parse_linsym_continuation_flag() {
+    // Standalone parse with continuation bit set.
+    let rec = make_record(0xC4, &[0x01, 0x01, 0x0A, 0x00, 0x00, 0x00]);
+    let parsed = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap();
+    assert!(parsed.flags.is_continuation());
+}
+
+#[test]
+fn omf_parse_linsym_reserved_flags_ignored() {
+    // Reserved bits 7-1 should be ignored.
+    let rec = make_record(0xC4, &[0xFE, 0x01, 0x0A, 0x00, 0x00, 0x00]);
+    let parsed = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap();
+    // Only bit 0 (continuation) is defined; 0xFE & 0x01 = 0
+    assert!(!parsed.flags.is_continuation());
 }

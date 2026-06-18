@@ -858,3 +858,82 @@ pub enum EntryPoint {
     /// Entry point is an external symbol ordinal + offset.
     External(u16, u32),
 }
+
+// ── LINSYM types (0xC4 / 0xC5) ────────────────────────────────────────────
+
+/// Which LINSYM variant this record is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinsymKind {
+    /// 0xC4 — 16-bit Line Number Offset.
+    Linsym16,
+    /// 0xC5 — 32-bit Line Number Offset.
+    Linsym32,
+}
+
+/// A single (line number, offset) pair within a LINSYM record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineEntry {
+    /// Source line number (0–65535).
+    pub line_number: u16,
+    /// Byte offset from the start of the COMDAT symbol base.
+    pub offset: u32,
+}
+
+/// Flags byte for a LINSYM record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinsymFlags(pub u8);
+
+impl LinsymFlags {
+    /// Continuation — data continues a previous LINSYM for this symbol.
+    pub const CONTINUATION: u8 = 0x01;
+
+    /// Create from a raw byte, truncating reserved bits.
+    pub fn from_bits_truncate(bits: u8) -> Self {
+        Self(bits & 0x01)
+    }
+
+    /// Returns true if the Continuation flag is set.
+    pub fn is_continuation(self) -> bool {
+        self.0 & Self::CONTINUATION != 0
+    }
+}
+
+/// A fully-parsed LINSYM or LINSYM32 record.
+#[derive(Debug, Clone)]
+pub struct LinsymRecord {
+    /// Which variant (16-bit or 32-bit offset).
+    pub kind: LinsymKind,
+    /// Flags byte.
+    pub flags: LinsymFlags,
+    /// Public name identifying the associated COMDAT symbol.
+    pub public_name: PublicName,
+    /// Ordered list of (line number, offset) mappings.
+    pub entries: Vec<LineEntry>,
+}
+
+/// Parser errors for LINSYM records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinsymError {
+    /// Unexpected end of input at the given offset.
+    #[allow(dead_code)]
+    UnexpectedEof(usize),
+    /// Record type byte is not 0xC4 or 0xC5.
+    WrongRecordType {
+        /// The actual record type byte found.
+        found: u8,
+    },
+    /// Line entry count is not a whole number — body size is not divisible by entry size.
+    UnalignedBody {
+        /// Number of remaining bytes in the body.
+        body: usize,
+        /// Expected entry size (4 for C4H, 6 for C5H).
+        entry_size: usize,
+    },
+    /// Checksum mismatch.
+    ChecksumMismatch {
+        /// The computed checksum value.
+        computed: u8,
+        /// The stored checksum value from the record.
+        stored: u8,
+    },
+}
