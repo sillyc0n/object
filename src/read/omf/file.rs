@@ -54,6 +54,8 @@ enum DataTarget {
     pub(super) has_ms_ext: bool,
     /// Parsed LINSYM (0xC4 / 0xC5) records.
     pub(super) linsym_records: Vec<super::LinsymRecord>,
+    /// Parsed LINNUM (0x94 / 0x95) records.
+    pub(super) linnum_records: Vec<super::LinnumRecord>,
     pub(super) marker: PhantomData<&'data ()>,
 }
 
@@ -79,6 +81,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             comdat_groups: Vec::new(),
             has_ms_ext: false,
             linsym_records: Vec::new(),
+            linnum_records: Vec::new(),
             marker: PhantomData,
         };
 
@@ -250,8 +253,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     self.parse_pubdef(record_body, is_local, is_32)?;
                     last_data_target = None;
                 }
-                omf::RT_LINNUM => {
-                    self.parse_linnum(record_body)?;
+                omf::RT_LINNUM | omf::RT_LINNUM32 => {
+                    let record_bytes = &data[pos..pos + 3 + record_length];
+                    let linnum = parse_linnum(record_bytes)
+                        .map_err(|_| Error("invalid LINNUM record"))?;
+                    self.linnum_records.push(linnum);
                     last_data_target = None;
                 }
                 omf::RT_COMDEF => {
@@ -971,30 +977,6 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             }
         }
 
-        Ok(())
-    }
-
-    fn parse_linnum(&mut self, body: &'data [u8]) -> Result<()> {
-        let mut pos = 0;
-
-        // group_index is always a single zero byte (p.672).
-        let group_index = *body.get(pos).read_error("truncated LINNUM group index")?;
-        if group_index != 0 {
-            return Err(Error("LINNUM group index must be zero"));
-        }
-        pos += 1;
-
-        let (_seg_idx, c) = omf::read_index(body, pos).read_error("truncated LINNUM segment")?;
-        pos += c;
-
-        while pos < body.len() {
-            if pos + 4 > body.len() {
-                return Err(Error("truncated LINNUM entry"));
-            }
-            // _line_number = u16::from_le_bytes([body[pos], body[pos + 1]]);
-            // _offset = u16::from_le_bytes([body[pos + 2], body[pos + 3]]);
-            pos += 4;
-        }
         Ok(())
     }
 
@@ -1824,6 +1806,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     /// Returns the parsed LINSYM (0xC4/0xC5) records.
     pub fn linsym_records(&self) -> &[super::LinsymRecord] {
         &self.linsym_records
+    }
+
+    /// Returns the parsed LINNUM (0x94/0x95) records.
+    pub fn linnum_records(&self) -> &[super::LinnumRecord] {
+        &self.linnum_records
     }
 
     /// Collect all THREAD subrecords from all FIXUPP records.
@@ -2849,6 +2836,132 @@ fn linsym_verify_checksum(record_bytes: &[u8]) -> core::result::Result<(), super
                 .fold(0u8, |acc, &b| acc.wrapping_add(b)),
         );
         return Err(super::LinsymError::ChecksumMismatch { computed, stored });
+    }
+    Ok(())
+}
+
+// ── Standalone LINNUM parser (spec-level) ───────────────────────────────────
+
+/// Parse a LINNUM or LINNUM32 record from a raw byte slice.
+///
+/// `input` must begin with the `0x94` or `0x95` type byte and include all
+/// bytes through (and including) the trailing checksum byte:
+///
+///   [type:1][length:2][base_group:1-2][base_seg:1-2]
+///   ([line_num:2][offset:2 or 4])* [checksum:1]
+pub fn parse_linnum(input: &[u8]) -> core::result::Result<super::LinnumRecord, super::LinnumError> {
+    let mut pos = 0usize;
+
+    let kind = match linnum_read_u8(input, &mut pos)? {
+        0x94 => super::LinnumKind::Linnum16,
+        0x95 => super::LinnumKind::Linnum32,
+        other => return Err(super::LinnumError::WrongRecordType { found: other }),
+    };
+
+    let record_length = linnum_read_u16_le(input, &mut pos)? as usize;
+    let record_end = pos + record_length;
+    if record_end > input.len() {
+        return Err(super::LinnumError::UnexpectedEof(input.len()));
+    }
+
+    linnum_verify_checksum(&input[..record_end])?;
+
+    let group_index = linnum_parse_index(input, &mut pos)?;
+    let segment_index = linnum_parse_index(input, &mut pos)?;
+    if segment_index == 0 {
+        return Err(super::LinnumError::ZeroSegmentIndex);
+    }
+
+    let data_end = record_end - 1;
+    let entry_size = match kind {
+        super::LinnumKind::Linnum16 => 4,
+        super::LinnumKind::Linnum32 => 6,
+    };
+    let body_remaining = data_end.saturating_sub(pos);
+    if body_remaining % entry_size != 0 {
+        return Err(super::LinnumError::UnalignedBody {
+            body: body_remaining,
+            entry_size,
+        });
+    }
+
+    let mut entries = Vec::with_capacity(body_remaining / entry_size);
+    while pos < data_end {
+        let line_number = linnum_read_u16_le(input, &mut pos)?;
+        if line_number > 0x7FFF {
+            return Err(super::LinnumError::LineNumberOutOfRange(line_number));
+        }
+        let offset = linnum_parse_line_offset(input, &mut pos, kind)?;
+        entries.push(super::LineEntry { line_number, offset });
+    }
+
+    Ok(super::LinnumRecord {
+        kind,
+        group_index,
+        segment_index,
+        entries,
+    })
+}
+
+fn linnum_read_u8(buf: &[u8], pos: &mut usize) -> core::result::Result<u8, super::LinnumError> {
+    buf.get(*pos).copied()
+        .map(|b| { *pos += 1; b })
+        .ok_or(super::LinnumError::UnexpectedEof(*pos))
+}
+
+fn linnum_read_u16_le(buf: &[u8], pos: &mut usize) -> core::result::Result<u16, super::LinnumError> {
+    let lo = linnum_read_u8(buf, pos)? as u16;
+    let hi = linnum_read_u8(buf, pos)? as u16;
+    Ok(lo | (hi << 8))
+}
+
+fn linnum_read_u32_le(buf: &[u8], pos: &mut usize) -> core::result::Result<u32, super::LinnumError> {
+    let b0 = linnum_read_u8(buf, pos)? as u32;
+    let b1 = linnum_read_u8(buf, pos)? as u32;
+    let b2 = linnum_read_u8(buf, pos)? as u32;
+    let b3 = linnum_read_u8(buf, pos)? as u32;
+    Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+}
+
+fn linnum_parse_index(buf: &[u8], pos: &mut usize) -> core::result::Result<u16, super::LinnumError> {
+    let b0 = linnum_read_u8(buf, pos)?;
+    if b0 & 0x80 == 0 {
+        Ok(b0 as u16)
+    } else {
+        let b1 = linnum_read_u8(buf, pos)?;
+        Ok((((b0 & 0x7F) as u16) << 8) | b1 as u16)
+    }
+}
+
+fn linnum_parse_line_offset(
+    buf: &[u8],
+    pos: &mut usize,
+    kind: super::LinnumKind,
+) -> core::result::Result<u32, super::LinnumError> {
+    match kind {
+        super::LinnumKind::Linnum16 => linnum_read_u16_le(buf, pos).map(|v| v as u32),
+        super::LinnumKind::Linnum32 => linnum_read_u32_le(buf, pos),
+    }
+}
+
+fn linnum_verify_checksum(record_bytes: &[u8]) -> core::result::Result<(), super::LinnumError> {
+    let stored = match record_bytes.last() {
+        Some(&b) => b,
+        None => return Err(super::LinnumError::UnexpectedEof(0)),
+    };
+    if stored == 0x00 {
+        return Ok(());
+    }
+    let sum: u8 = record_bytes
+        .iter()
+        .fold(0u8, |acc, &b| acc.wrapping_add(b));
+    if sum != 0 {
+        let computed = 0u8.wrapping_sub(
+            record_bytes[..record_bytes.len() - 1]
+                .iter()
+                .fold(0u8, |acc, &b| acc.wrapping_add(b)),
+        );
+        return Err(super::LinnumError::ChecksumMismatch { computed, stored });
     }
     Ok(())
 }

@@ -31,8 +31,10 @@ pub const RT_PUBDEF32: u8 = 0x91;
 pub const RT_LOCAL_PUBDEF: u8 = 0xB6;
 /// LPUBDEF32: 32-bit Local Public Names Definition Record.
 pub const RT_LOCAL_PUBDEF32: u8 = 0xB7;
-/// LINNUM: Line Number Record.
+/// LINNUM: Line Number Record (16-bit offset).
 pub const RT_LINNUM: u8 = 0x94;
+/// LINNUM32: 32-bit Line Number Record (32-bit offset).
+pub const RT_LINNUM32: u8 = 0x95;
 /// LNAMES: List of Names Record.
 pub const RT_LNAMES: u8 = 0x96;
 /// SEGDEF: Segment Definition Record.

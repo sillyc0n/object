@@ -870,13 +870,20 @@ pub enum LinsymKind {
     Linsym32,
 }
 
-/// A single (line number, offset) pair within a LINSYM record.
+/// A single (line number, offset) pair within a LINSYM or LINNUM record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineEntry {
     /// Source line number (0–65535).
     pub line_number: u16,
-    /// Byte offset from the start of the COMDAT symbol base.
+    /// Byte offset from the start of the COMDAT symbol base or segment.
     pub offset: u32,
+}
+
+impl LineEntry {
+    /// Returns true if this entry is the end-of-function sentinel (line number 0).
+    pub fn is_end_sentinel(self) -> bool {
+        self.line_number == 0
+    }
 }
 
 /// Flags byte for a LINSYM record.
@@ -927,6 +934,61 @@ pub enum LinsymError {
         /// Number of remaining bytes in the body.
         body: usize,
         /// Expected entry size (4 for C4H, 6 for C5H).
+        entry_size: usize,
+    },
+    /// Checksum mismatch.
+    ChecksumMismatch {
+        /// The computed checksum value.
+        computed: u8,
+        /// The stored checksum value from the record.
+        stored: u8,
+    },
+}
+
+// ── LINNUM types (0x94 / 0x95) ────────────────────────────────────────────
+
+/// Which LINNUM variant this record is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinnumKind {
+    /// 0x94 — 16-bit Line Number Offset.
+    Linnum16,
+    /// 0x95 — 32-bit Line Number Offset.
+    Linnum32,
+}
+
+/// A fully-parsed LINNUM or LINNUM32 record.
+#[derive(Debug, Clone)]
+pub struct LinnumRecord {
+    /// Which variant (16-bit or 32-bit offset).
+    pub kind: LinnumKind,
+    /// Index into the GRPDEF table; 0 = no group.
+    pub group_index: u16,
+    /// Index into the SEGDEF table; identifies the segment all offsets are relative to.
+    pub segment_index: u16,
+    /// Ordered list of (line number, offset) mappings.
+    pub entries: Vec<LineEntry>,
+}
+
+/// Parser errors for LINNUM records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinnumError {
+    /// Unexpected end of input at the given offset.
+    #[allow(dead_code)]
+    UnexpectedEof(usize),
+    /// Record type byte is not 0x94 or 0x95.
+    WrongRecordType {
+        /// The actual record type byte found.
+        found: u8,
+    },
+    /// Base segment index is zero; LINNUM must reference a relocatable segment.
+    ZeroSegmentIndex,
+    /// Line number exceeds maximum value 0x7FFF.
+    LineNumberOutOfRange(u16),
+    /// Body size is not divisible by entry size.
+    UnalignedBody {
+        /// Number of remaining bytes in the body.
+        body: usize,
+        /// Expected entry size (4 for 0x94, 6 for 0x95).
         entry_size: usize,
     },
     /// Checksum mismatch.

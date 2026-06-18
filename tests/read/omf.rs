@@ -3,6 +3,7 @@ use object::read::omf::{
     parse_pubdef_record, PubdefRecord, PubdefKind, PubdefBase, PubdefEntry, PubdefError,
     parse_lpubdef, LpubdefParseError, OffsetWidth, OmfIndex,
     parse_linsym, LinsymKind, LineEntry, LinsymError,
+    parse_linnum, LinnumKind, LinnumError,
     PublicName, PublicNameEncoding,
 };
 use object::{Architecture, BinaryFormat, Object, ObjectComdat, ObjectSection, ObjectSegment, ObjectSymbol, Permissions, RelocationTarget, SectionIndex, SectionKind, SymbolIndex};
@@ -2791,4 +2792,252 @@ fn omf_parse_linsym_reserved_flags_ignored() {
     let parsed = parse_linsym(&rec, PublicNameEncoding::MicrosoftIndex).unwrap();
     // Only bit 0 (continuation) is defined; 0xFE & 0x01 = 0
     assert!(!parsed.flags.is_continuation());
+}
+
+// ── LINNUM (0x94 / 0x95) tests ────────────────────────────────────────────
+
+#[test]
+fn omf_linnum_basic() {
+    // 0x94 integrated through OmfFile::parse.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // LINNUM: group=0, seg=1, 3 entries:
+    //   line=2 offset=0x0000  line=3 offset=0x0008  line=4 offset=0x000F
+    data.extend(make_record(0x94, &[
+        0x00, 0x01,
+        0x02, 0x00, 0x00, 0x00,
+        0x03, 0x00, 0x08, 0x00,
+        0x04, 0x00, 0x0F, 0x00,
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let linnums = obj.linnum_records();
+    assert_eq!(linnums.len(), 1);
+    let rec = &linnums[0];
+    assert_eq!(rec.kind, LinnumKind::Linnum16);
+    assert_eq!(rec.group_index, 0);
+    assert_eq!(rec.segment_index, 1);
+    assert_eq!(rec.entries.len(), 3);
+    assert_eq!(rec.entries[0], LineEntry { line_number: 2, offset: 0x0000 });
+    assert_eq!(rec.entries[1], LineEntry { line_number: 3, offset: 0x0008 });
+    assert_eq!(rec.entries[2], LineEntry { line_number: 4, offset: 0x000F });
+}
+
+#[test]
+fn omf_linnum32_basic() {
+    // 0x95 integrated through OmfFile::parse with 32-bit offsets.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // LINNUM32: group=0, seg=1, 2 entries with 32-bit offsets:
+    //   line=5 offset=0x00000100  line=6 offset=0x00010000
+    data.extend(make_record(0x95, &[
+        0x00, 0x01,
+        0x05, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x06, 0x00, 0x00, 0x00, 0x01, 0x00,
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let linnums = obj.linnum_records();
+    assert_eq!(linnums.len(), 1);
+    let rec = &linnums[0];
+    assert_eq!(rec.kind, LinnumKind::Linnum32);
+    assert_eq!(rec.entries[0], LineEntry { line_number: 5, offset: 0x100 });
+    assert_eq!(rec.entries[1], LineEntry { line_number: 6, offset: 0x10000 });
+}
+
+#[test]
+fn omf_linnum_sentinel() {
+    // End-of-function sentinel (line number 0).
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // group=0, seg=1, line=10 offset=0x0000, then sentinel line=0 offset=0x0018
+    data.extend(make_record(0x94, &[
+        0x00, 0x01,
+        0x0A, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x18, 0x00,
+    ]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let linnums = obj.linnum_records();
+    assert_eq!(linnums[0].entries.len(), 2);
+    assert!(!linnums[0].entries[0].is_end_sentinel());
+    assert!(linnums[0].entries[1].is_end_sentinel());
+}
+
+#[test]
+fn omf_linnum_zero_entries() {
+    // No entries (only base fields) is valid.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // group=0, seg=1, no entries
+    data.extend(make_record(0x94, &[0x00, 0x01]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert!(obj.linnum_records()[0].entries.is_empty());
+}
+
+#[test]
+fn omf_linnum_multiple_records() {
+    // Two LINNUM records for the same segment.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x94, &[0x00, 0x01, 0x01, 0x00, 0x00, 0x00]));
+    data.extend(make_record(0x95, &[0x00, 0x01, 0x02, 0x00, 0x78, 0x56, 0x34, 0x12]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    let linnums = obj.linnum_records();
+    assert_eq!(linnums.len(), 2);
+    assert_eq!(linnums[0].kind, LinnumKind::Linnum16);
+    assert_eq!(linnums[0].entries[0].line_number, 1);
+    assert_eq!(linnums[1].kind, LinnumKind::Linnum32);
+    assert_eq!(linnums[1].entries[0].offset, 0x12345678);
+}
+
+#[test]
+fn omf_linnum_two_byte_group_index() {
+    // Group index encoded as 2-byte OMF index.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // group=0x0080 (2-byte, value=0), seg=1
+    data.extend(make_record(0x94, &[0x80, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.linnum_records()[0].group_index, 0);
+    assert_eq!(obj.linnum_records()[0].segment_index, 1);
+}
+
+// ── Standalone LINNUM parser tests (spec-level) ────────────────────────────
+
+#[test]
+fn omf_parse_linnum_94_basic() {
+    // Spec example from §9: 94 0F 00 00 01 02 00 00 00 03 00 08 00 04 00 0F 00 3C
+    let raw: &[u8] = &[
+        0x94, 0x0F, 0x00,
+        0x00, 0x01,
+        0x02, 0x00, 0x00, 0x00,
+        0x03, 0x00, 0x08, 0x00,
+        0x04, 0x00, 0x0F, 0x00,
+        0x3C,
+    ];
+    let parsed = parse_linnum(raw).unwrap();
+    assert_eq!(parsed.kind, LinnumKind::Linnum16);
+    assert_eq!(parsed.group_index, 0);
+    assert_eq!(parsed.segment_index, 1);
+    assert_eq!(parsed.entries.len(), 3);
+    assert_eq!(parsed.entries[0], LineEntry { line_number: 2, offset: 0x0000 });
+    assert_eq!(parsed.entries[1], LineEntry { line_number: 3, offset: 0x0008 });
+    assert_eq!(parsed.entries[2], LineEntry { line_number: 4, offset: 0x000F });
+}
+
+#[test]
+fn omf_parse_linnum_95_basic() {
+    // Minimal 0x95 record with one 32-bit offset entry.
+    let raw: &[u8] = &[
+        0x95, 0x09, 0x00,
+        0x00, 0x01,
+        0x0A, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, // checksum: 0x95+0x09+0x00+0x00+0x01+0x0A+0x00+0x00+0x01+0x00+0x00=0x00 (mod 256)
+    ];
+    let parsed = parse_linnum(raw).unwrap();
+    assert_eq!(parsed.kind, LinnumKind::Linnum32);
+    assert_eq!(parsed.entries[0], LineEntry { line_number: 10, offset: 0x100 });
+}
+
+#[test]
+fn omf_parse_linnum_wrong_type() {
+    let rec = make_record(0x90, &[0x00, 0x01]);
+    let err = parse_linnum(&rec).unwrap_err();
+    assert_eq!(err, LinnumError::WrongRecordType { found: 0x90 });
+}
+
+#[test]
+fn omf_parse_linnum_zero_segment() {
+    // Segment index 0 should be rejected.
+    let rec = make_record(0x94, &[0x00, 0x00]);
+    let err = parse_linnum(&rec).unwrap_err();
+    assert_eq!(err, LinnumError::ZeroSegmentIndex);
+}
+
+#[test]
+fn omf_parse_linnum_line_number_out_of_range() {
+    // Line number > 0x7FFF should be rejected.
+    // 0x8000 in little-endian is [0x00, 0x80].
+    let rec = make_record(0x94, &[
+        0x00, 0x01,
+        0x00, 0x80, 0x00, 0x00, // line=0x8000, offset=0
+    ]);
+    let err = parse_linnum(&rec).unwrap_err();
+    assert_eq!(err, LinnumError::LineNumberOutOfRange(0x8000));
+}
+
+#[test]
+fn omf_parse_linnum_checksum_mismatch() {
+    let mut rec = make_record(0x94, &[0x00, 0x01, 0x01, 0x00, 0x00, 0x00]);
+    if let Some(last) = rec.last_mut() {
+        *last = last.wrapping_add(1);
+    }
+    let err = parse_linnum(&rec).unwrap_err();
+    assert!(matches!(err, LinnumError::ChecksumMismatch { .. }));
+}
+
+#[test]
+fn omf_parse_linnum_checksum_zero_accepted() {
+    let mut rec = make_record(0x94, &[0x00, 0x01, 0x01, 0x00, 0x00, 0x00]);
+    let len = rec.len();
+    rec[len - 1] = 0x00;
+    let parsed = parse_linnum(&rec).unwrap();
+    assert_eq!(parsed.entries.len(), 1);
+}
+
+#[test]
+fn omf_parse_linnum_unaligned_body() {
+    // 5 bytes remaining after base fields, not divisible by entry_size=4.
+    let rec = make_record(0x94, &[0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0xFF]);
+    let err = parse_linnum(&rec).unwrap_err();
+    assert!(matches!(err, LinnumError::UnalignedBody { body: 5, entry_size: 4 }));
+}
+
+#[test]
+fn omf_parse_linnum_unaligned_body_c5() {
+    // 3 bytes remaining, not divisible by 6.
+    let rec = make_record(0x95, &[
+        0x80, 0x00, // group=0 (2-byte index)
+        0x01,       // seg=1
+        0x01, 0x00, 0x00, // 3 bytes remaining; 3 % 6 = 3
+    ]);
+    let err = parse_linnum(&rec).unwrap_err();
+    assert!(matches!(err, LinnumError::UnalignedBody { body: 3, entry_size: 6 }));
+}
+
+#[test]
+fn omf_parse_linnum_spec_example() {
+    // Exact bytes from §9:
+    // 94 0F 00 00 01 02 00 00 00 03 00 08 00 04 00 0F 00 3C
+    let raw: &[u8] = &[
+        0x94, 0x0F, 0x00,
+        0x00, 0x01,
+        0x02, 0x00, 0x00, 0x00,
+        0x03, 0x00, 0x08, 0x00,
+        0x04, 0x00, 0x0F, 0x00,
+        0x3C,
+    ];
+    let parsed = parse_linnum(raw).unwrap();
+    assert_eq!(parsed.group_index, 0);
+    assert_eq!(parsed.segment_index, 1);
+    assert_eq!(parsed.entries.len(), 3);
+    assert_eq!(parsed.entries[0], LineEntry { line_number: 2, offset: 0x0000 });
+    assert_eq!(parsed.entries[1], LineEntry { line_number: 3, offset: 0x0008 });
+    assert_eq!(parsed.entries[2], LineEntry { line_number: 4, offset: 0x000F });
 }
