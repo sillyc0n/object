@@ -25,8 +25,12 @@ pub const RT_LOCAL_EXTDEF: u8 = 0xB4;
 pub const RT_TYPDEF: u8 = 0x8E;
 /// PUBDEF: Public Names Definition Record.
 pub const RT_PUBDEF: u8 = 0x90;
+/// PUBDEF32: 32-bit Public Names Definition Record.
+pub const RT_PUBDEF32: u8 = 0x91;
 /// LPUBDEF: Local Public Names Definition Record.
 pub const RT_LOCAL_PUBDEF: u8 = 0xB6;
+/// LPUBDEF32: 32-bit Local Public Names Definition Record.
+pub const RT_LOCAL_PUBDEF32: u8 = 0xB7;
 /// LINNUM: Line Number Record.
 pub const RT_LINNUM: u8 = 0x94;
 /// LNAMES: List of Names Record.
@@ -49,6 +53,10 @@ pub const RT_LEDATA32: u8 = 0xA1;
 pub const RT_LIDATA: u8 = 0xA2;
 /// COMDEF: Communal Names Definition Record.
 pub const RT_COMDEF: u8 = 0xB0;
+/// COMDAT: Communal Data Record (16-bit data offset).
+pub const RT_COMDAT: u8 = 0xC2;
+/// COMDAT32: 32-bit Communal Data Record (32-bit data offset).
+pub const RT_COMDAT32: u8 = 0xC3;
 
 // ── SEGDEF ACBP byte ──────────────────────────────────────────────────────
 //

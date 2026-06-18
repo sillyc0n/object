@@ -18,6 +18,9 @@ use super::*;
 enum DataTarget {
     Segment(u16),
     Communal { comdef_ord: u16 },
+    /// A COMDAT (0xC2/0xC3) record identified by its index in
+    /// `OmfFile::comdat_records`.
+    Comdat { index: usize },
     Unknown,
 }
 
@@ -40,6 +43,8 @@ enum DataTarget {
     pub comdefs: Vec<crate::read::omf::ParsedComdefEntry<'data>>,
     /// Decoded FIXUPP records for dump purposes.
     fixupp_records: Vec<ParsedFixuppRecord>,
+    /// Parsed COMDAT (0xC2/0xC3) records.
+    pub(super) comdat_records: Vec<super::CombatRecord>,
     pub(super) extdef_symbol_indices: Vec<SymbolIndex>,
     pub(super) entry: EntryPoint,
     /// COMDAT groups derived from COMDEF entries.
@@ -66,6 +71,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             typdefs: Vec::new(),
             comdefs: Vec::new(),
             fixupp_records: Vec::new(),
+            comdat_records: Vec::new(),
             extdef_symbol_indices: Vec::new(),
             entry: EntryPoint::None,
             comdat_groups: Vec::new(),
@@ -232,9 +238,13 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     self.parse_typdef(record_body)?;
                     last_data_target = None;
                 }
-                omf::RT_PUBDEF | omf::RT_LOCAL_PUBDEF => {
-                    let is_local = record_type == omf::RT_LOCAL_PUBDEF;
-                    self.parse_pubdef(record_body, is_local)?;
+                omf::RT_PUBDEF | omf::RT_PUBDEF32
+                | omf::RT_LOCAL_PUBDEF | omf::RT_LOCAL_PUBDEF32 => {
+                    let is_local = record_type == omf::RT_LOCAL_PUBDEF
+                        || record_type == omf::RT_LOCAL_PUBDEF32;
+                    let is_32 = record_type == omf::RT_PUBDEF32
+                        || record_type == omf::RT_LOCAL_PUBDEF32;
+                    self.parse_pubdef(record_body, is_local, is_32)?;
                     last_data_target = None;
                 }
                 omf::RT_LINNUM => {
@@ -311,6 +321,17 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                         record_type == omf::RT_FIXUPP32,
                     )?;
                     last_data_target = None;
+                }
+                omf::RT_COMDAT | omf::RT_COMDAT32 => {
+                    let _is_32 = record_type == omf::RT_COMDAT32;
+                    let name_encoding = super::PublicNameEncoding::MicrosoftIndex;
+                    let record_bytes = &data[pos..pos + 3 + record_length];
+                    let comdat = super::parse_comdat(record_bytes, name_encoding)
+                        .map_err(|_| Error("invalid COMDAT record"))?;
+                    let comdat_index = self.comdat_records.len();
+                    self.comdat_records.push(comdat);
+                    last_data_target = Some(DataTarget::Comdat { index: comdat_index });
+                    last_data_seg_offset = 0;
                 }
                 omf::RT_MODEND | omf::RT_MODEND32 => {
                     // MODEND (0x8A) and MODEND32 (0x8B) differ only in the
@@ -880,14 +901,15 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         Ok(())
     }
 
-    fn parse_pubdef(&mut self, body: &'data [u8], is_local: bool) -> Result<()> {
+    fn parse_pubdef(&mut self, body: &'data [u8], is_local: bool, is_32: bool) -> Result<()> {
         let mut pos = 0;
-        let (group_idx, c) = omf::read_index(body, pos).read_error("truncated PUBDEF group")?;
+        let (_group_idx, c) = omf::read_index(body, pos).read_error("truncated PUBDEF group")?;
         pos += c;
         let (seg_idx, c) = omf::read_index(body, pos).read_error("truncated PUBDEF segment")?;
         pos += c;
 
-        if seg_idx == 0 && group_idx == 0 {
+        // Base Frame is present when Base Segment Index = 0 (regardless of group)
+        if seg_idx == 0 {
             if pos + 2 > body.len() {
                 return Err(Error("truncated PUBDEF frame"));
             }
@@ -898,11 +920,22 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
         while pos < body.len() {
             let (name, c) = omf::read_name(body, pos).read_error("truncated PUBDEF name")?;
             pos += c;
-            if pos + 2 > body.len() {
-                return Err(Error("truncated PUBDEF offset"));
+            let pub_offset = if is_32 {
+                if pos + 4 > body.len() {
+                    return Err(Error("truncated PUBDEF32 offset"));
+                }
+                let off = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+                pos += 4;
+                off
+            } else {
+                if pos + 2 > body.len() {
+                    return Err(Error("truncated PUBDEF offset"));
+                }
+                u16::from_le_bytes([body[pos], body[pos + 1]]) as u32
+            };
+            if !is_32 {
+                pos += 2;
             }
-            let pub_offset = u16::from_le_bytes([body[pos], body[pos + 1]]);
-            pos += 2;
             let (_type_idx, c) = omf::read_index(body, pos).read_error("truncated PUBDEF type")?;
             pos += c;
 
@@ -1050,6 +1083,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 DataTarget::Communal { comdef_ord } => {
                     write!(&mut extra, "target=communal ordinal(extdef)={}", comdef_ord).ok();
                 }
+                DataTarget::Comdat { index } => {
+                    write!(&mut extra, "target=COMDAT index={}", index).ok();
+                }
                 DataTarget::Unknown => {
                     write!(&mut extra, "target=unknown idx={}", seg_idx).ok();
                 }
@@ -1109,6 +1145,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     }
                 }
                 return Err(Error("LEDATA segment index out of range"));
+            }
+            DataTarget::Comdat { .. } => {
+                return Err(Error("LEDATA cannot target COMDAT records"));
             }
             DataTarget::Unknown => return Err(Error("LEDATA segment index out of range")),
         }
@@ -1177,6 +1216,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                 DataTarget::Communal { comdef_ord } => {
                     write!(&mut extra, "target=communal ordinal(extdef)={}", comdef_ord).ok();
                 }
+                DataTarget::Comdat { index } => {
+                    write!(&mut extra, "target=COMDAT index={}", index).ok();
+                }
                 DataTarget::Unknown => {
                     write!(&mut extra, "target=unknown idx={}", seg_idx).ok();
                 }
@@ -1236,6 +1278,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     }
                 }
                 return Err(Error("LIDATA segment index out of range"));
+            }
+            DataTarget::Comdat { .. } => {
+                return Err(Error("LIDATA cannot target COMDAT records"));
             }
             DataTarget::Unknown => return Err(Error("LIDATA segment index out of range")),
         }
@@ -1397,6 +1442,19 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                                 return Err(Error("FIXUPP refers to unknown COMDEF symbol"));
                             }
                         }
+                        DataTarget::Comdat { index } => {
+                            if *index >= self.comdat_records.len() {
+                                return Err(Error("FIXUPP refers to unknown COMDAT record"));
+                            }
+                            let comdat = &mut self.comdat_records[*index];
+                            comdat.relocs.push(ParsedReloc {
+                                offset: full_offset,
+                                loc,
+                                is_seg_rel,
+                                target: reloc_target.clone(),
+                                displacement: target_displacement.unwrap_or(0),
+                            });
+                        }
                         &DataTarget::Unknown => return Err(Error("FIXUPP segment index out of range")),
                     }
                 }
@@ -1405,6 +1463,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
 
         let attached_seg_ordinal = last_data_target.as_ref().and_then(|t| match t {
             DataTarget::Segment(o) => Some(*o),
+            DataTarget::Comdat { index } => {
+                #[cfg(debug_assertions)]
+                eprintln!("FIXUPP attached to COMDAT record {}", index);
+                None
+            }
             _ => None,
         });
 
@@ -1740,6 +1803,11 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
     /// Raw-format accessor: return the parsed COMDEF entries.
     pub fn raw_comdefs(&self) -> &[crate::read::omf::ParsedComdefEntry<'data>] {
         &self.comdefs
+    }
+
+    /// Returns the parsed COMDAT (0xC2/0xC3) records.
+    pub fn comdat_records(&self) -> &[super::CombatRecord] {
+        &self.comdat_records
     }
 
     /// Collect all THREAD subrecords from all FIXUPP records.
@@ -2096,5 +2164,520 @@ impl<'data, R: ReadRef<'data>> Object<'data> for OmfFile<'data, R> {
 
     fn flags(&self) -> FileFlags {
         FileFlags::None
+    }
+}
+
+// ── Standalone COMDEF parser (spec-level) ──────────────────────────────────
+
+fn comdef_read_u8(buf: &[u8], pos: &mut usize) -> core::result::Result<u8, super::ComdefError> {
+    buf.get(*pos).copied().map(|b| {
+        *pos += 1;
+        b
+    })
+    .ok_or(super::ComdefError::UnexpectedEof(*pos))
+}
+
+fn comdef_parse_index(buf: &[u8], pos: &mut usize) -> core::result::Result<u16, super::ComdefError> {
+    let b0 = comdef_read_u8(buf, pos)?;
+    if b0 & 0x80 == 0 {
+        Ok(b0 as u16)
+    } else {
+        let b1 = comdef_read_u8(buf, pos)?;
+        Ok((((b0 & 0x7F) as u16) << 8) | b1 as u16)
+    }
+}
+
+fn comdef_parse_communal_length(
+    buf: &[u8],
+    pos: &mut usize,
+) -> core::result::Result<u32, super::ComdefError> {
+    let lead = comdef_read_u8(buf, pos)?;
+    match lead {
+        0x00..=0x80 => Ok(lead as u32),
+        0x81 => {
+            let lo = comdef_read_u8(buf, pos)? as u32;
+            let hi = comdef_read_u8(buf, pos)? as u32;
+            Ok(lo | (hi << 8))
+        }
+        0x84 => {
+            let b0 = comdef_read_u8(buf, pos)? as u32;
+            let b1 = comdef_read_u8(buf, pos)? as u32;
+            let b2 = comdef_read_u8(buf, pos)? as u32;
+            Ok(b0 | (b1 << 8) | (b2 << 16))
+        }
+        0x88 => {
+            let b0 = comdef_read_u8(buf, pos)? as u32;
+            let b1 = comdef_read_u8(buf, pos)? as u32;
+            let b2 = comdef_read_u8(buf, pos)? as u32;
+            let b3 = comdef_read_u8(buf, pos)? as u32;
+            Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+        }
+        other => Err(super::ComdefError::InvalidLengthPrefix(other)),
+    }
+}
+
+/// Parse a complete COMDEF record (0xB0) from a raw byte slice.
+///
+/// `input` must begin with the 0xB0 type byte and include all bytes
+/// through (and including) the trailing checksum.
+pub fn parse_comdef_record(input: &[u8]) -> core::result::Result<super::ComdefRecord, super::ComdefError> {
+    let mut pos = 0usize;
+
+    let record_type = comdef_read_u8(input, &mut pos)?;
+    if record_type != 0xB0 {
+        return Err(super::ComdefError::WrongRecordType { found: record_type });
+    }
+
+    let len_lo = comdef_read_u8(input, &mut pos)? as usize;
+    let len_hi = comdef_read_u8(input, &mut pos)? as usize;
+    let record_length = len_lo | (len_hi << 8);
+    let body_end = pos + record_length;
+    if body_end > input.len() {
+        return Err(super::ComdefError::UnexpectedEof(input.len()));
+    }
+
+    // Verify checksum
+    let stored = input.last().copied().unwrap_or(0);
+    if stored != 0x00 {
+        let sum: u8 = input.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        if sum != 0 {
+            let computed = 0u8.wrapping_sub(input[..input.len() - 1].iter().fold(0u8, |acc, &b| acc.wrapping_add(b)));
+            return Err(super::ComdefError::ChecksumMismatch { computed, stored });
+        }
+    }
+
+    let data_end = body_end - 1;
+    let mut entries = Vec::new();
+
+    while pos < data_end {
+        let name_len = comdef_read_u8(input, &mut pos)? as usize;
+        if pos + name_len > data_end {
+            return Err(super::ComdefError::UnexpectedEof(pos));
+        }
+        let name = input[pos..pos + name_len].to_vec();
+        pos += name_len;
+
+        let type_index = comdef_parse_index(input, &mut pos)?;
+        let data_type = comdef_read_u8(input, &mut pos)?;
+
+        let communal = match data_type {
+            0x01..=0x5F => super::ComdefKind::BorlandSegment { index: data_type },
+            0x61 => {
+                let count = comdef_parse_communal_length(input, &mut pos)?;
+                let element_size = comdef_parse_communal_length(input, &mut pos)?;
+                super::ComdefKind::Far { count, element_size }
+            }
+            0x62 => {
+                let size = comdef_parse_communal_length(input, &mut pos)?;
+                super::ComdefKind::Near { size }
+            }
+            other => return Err(super::ComdefError::UnknownDataType(other)),
+        };
+
+        entries.push(super::ComdefEntry {
+            name,
+            type_index,
+            communal,
+        });
+    }
+
+    Ok(super::ComdefRecord { entries })
+}
+
+// ── Standalone COMDAT parser (spec-level) ──────────────────────────────────
+
+fn comdat_read_u8(buf: &[u8], pos: &mut usize) -> core::result::Result<u8, super::CombatError> {
+    buf.get(*pos).copied()
+        .map(|b| { *pos += 1; b })
+        .ok_or(super::CombatError::UnexpectedEof(*pos))
+}
+
+fn comdat_read_u16_le(buf: &[u8], pos: &mut usize) -> core::result::Result<u16, super::CombatError> {
+    let lo = comdat_read_u8(buf, pos)? as u16;
+    let hi = comdat_read_u8(buf, pos)? as u16;
+    Ok(lo | (hi << 8))
+}
+
+fn comdat_read_u32_le(buf: &[u8], pos: &mut usize) -> core::result::Result<u32, super::CombatError> {
+    let b0 = comdat_read_u8(buf, pos)? as u32;
+    let b1 = comdat_read_u8(buf, pos)? as u32;
+    let b2 = comdat_read_u8(buf, pos)? as u32;
+    let b3 = comdat_read_u8(buf, pos)? as u32;
+    Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+}
+
+fn comdat_parse_index(buf: &[u8], pos: &mut usize) -> core::result::Result<u16, super::CombatError> {
+    let b0 = comdat_read_u8(buf, pos)?;
+    if b0 & 0x80 == 0 {
+        Ok(b0 as u16)
+    } else {
+        let b1 = comdat_read_u8(buf, pos)?;
+        Ok((((b0 & 0x7F) as u16) << 8) | b1 as u16)
+    }
+}
+
+/// Parse a COMDAT or COMDAT32 record from a raw byte slice.
+///
+/// `input` must begin with the 0xC2 or 0xC3 type byte and include all
+/// bytes through (and including) the trailing checksum byte.
+pub fn parse_comdat(
+    input: &[u8],
+    name_encoding: super::PublicNameEncoding,
+) -> core::result::Result<super::CombatRecord, super::CombatError> {
+    let mut pos = 0usize;
+
+    let kind = match comdat_read_u8(input, &mut pos)? {
+        0xC2 => super::CombatKind::Comdat16,
+        0xC3 => super::CombatKind::Comdat32,
+        other => return Err(super::CombatError::WrongRecordType { found: other }),
+    };
+
+    let record_length = comdat_read_u16_le(input, &mut pos)? as usize;
+    let record_end = pos + record_length;
+    if record_end > input.len() {
+        return Err(super::CombatError::UnexpectedEof(input.len()));
+    }
+
+    // Verify checksum
+    let stored = input.last().copied().unwrap_or(0);
+    if stored != 0x00 {
+        let sum: u8 = input.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        if sum != 0 {
+            let computed = 0u8.wrapping_sub(input[..input.len() - 1].iter().fold(0u8, |acc, &b| acc.wrapping_add(b)));
+            return Err(super::CombatError::ChecksumMismatch { computed, stored });
+        }
+    }
+
+    let flags_byte = comdat_read_u8(input, &mut pos)?;
+    let flags = super::CombatFlags::from_bits_truncate(flags_byte);
+
+    let attr_byte = comdat_read_u8(input, &mut pos)?;
+    let sel_nibble = (attr_byte >> 4) & 0x0F;
+    let alloc_nibble = attr_byte & 0x0F;
+    let selection = super::SelectionCriteria::from_nibble(sel_nibble)
+        .ok_or(super::CombatError::ReservedSelectionCriteria(sel_nibble))?;
+    let allocation = super::AllocationType::from_nibble(alloc_nibble)
+        .ok_or(super::CombatError::ReservedAllocationType(alloc_nibble))?;
+    let attributes = super::CombatAttributes { selection, allocation };
+
+    let align_byte = comdat_read_u8(input, &mut pos)?;
+    let align = super::CombatAlign::from_u8(align_byte);
+
+    let data_offset = match kind {
+        super::CombatKind::Comdat16 => comdat_read_u16_le(input, &mut pos)? as u32,
+        super::CombatKind::Comdat32 => comdat_read_u32_le(input, &mut pos)?,
+    };
+
+    let type_index = comdat_parse_index(input, &mut pos)?;
+
+    let public_base = if allocation.has_public_base() {
+        let group_index = comdat_parse_index(input, &mut pos)?;
+        let segment_index = comdat_parse_index(input, &mut pos)?;
+        let segment = if segment_index == 0 {
+            let frame = comdat_read_u16_le(input, &mut pos)?;
+            super::SegmentBase::Absolute { frame }
+        } else {
+            super::SegmentBase::Segment(segment_index)
+        };
+        Some(super::PublicBase { group_index, segment })
+    } else {
+        None
+    };
+
+    let public_name = match name_encoding {
+        super::PublicNameEncoding::MicrosoftIndex => {
+            super::PublicName::Index(comdat_parse_index(input, &mut pos)?)
+        }
+        super::PublicNameEncoding::IbmString => {
+            let len = comdat_read_u8(input, &mut pos)? as usize;
+            if pos + len > record_end {
+                return Err(super::CombatError::UnexpectedEof(pos));
+            }
+            let name = input[pos..pos + len].to_vec();
+            pos += len;
+            super::PublicName::Name(name)
+        }
+    };
+
+    let data_end = record_end - 1;
+    let data_len = data_end.saturating_sub(pos);
+    if data_len > 1024 {
+        return Err(super::CombatError::DataTooLong(data_len));
+    }
+    let data = input[pos..data_end].to_vec();
+
+    Ok(super::CombatRecord {
+        kind,
+        flags,
+        attributes,
+        align,
+        data_offset,
+        type_index,
+        public_base,
+        public_name,
+        data,
+        relocs: Vec::new(),
+    })
+}
+
+// ── Standalone PUBDEF parser (spec-level) ───────────────────────────────────
+
+fn pubdef_read_u8(buf: &[u8], pos: &mut usize) -> core::result::Result<u8, super::PubdefError> {
+    buf.get(*pos).copied()
+        .map(|b| { *pos += 1; b })
+        .ok_or(super::PubdefError::UnexpectedEof(*pos))
+}
+
+fn pubdef_read_u16_le(buf: &[u8], pos: &mut usize) -> core::result::Result<u16, super::PubdefError> {
+    let lo = pubdef_read_u8(buf, pos)? as u16;
+    let hi = pubdef_read_u8(buf, pos)? as u16;
+    Ok(lo | (hi << 8))
+}
+
+fn pubdef_read_u32_le(buf: &[u8], pos: &mut usize) -> core::result::Result<u32, super::PubdefError> {
+    let b0 = pubdef_read_u8(buf, pos)? as u32;
+    let b1 = pubdef_read_u8(buf, pos)? as u32;
+    let b2 = pubdef_read_u8(buf, pos)? as u32;
+    let b3 = pubdef_read_u8(buf, pos)? as u32;
+    Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+}
+
+fn pubdef_parse_index(buf: &[u8], pos: &mut usize) -> core::result::Result<u16, super::PubdefError> {
+    let b0 = pubdef_read_u8(buf, pos)?;
+    if b0 & 0x80 == 0 {
+        Ok(b0 as u16)
+    } else {
+        let b1 = pubdef_read_u8(buf, pos)?;
+        Ok((((b0 & 0x7F) as u16) << 8) | b1 as u16)
+    }
+}
+
+fn pubdef_parse_base(buf: &[u8], pos: &mut usize) -> core::result::Result<super::PubdefBase, super::PubdefError> {
+    let group_index   = pubdef_parse_index(buf, pos)?;
+    let segment_index = pubdef_parse_index(buf, pos)?;
+
+    if segment_index == 0 {
+        let frame = pubdef_read_u16_le(buf, pos)?;
+        Ok(super::PubdefBase::Frame { group_index, frame })
+    } else {
+        Ok(super::PubdefBase::Segment { group_index, segment_index })
+    }
+}
+
+fn pubdef_parse_name(buf: &[u8], pos: &mut usize) -> core::result::Result<String, super::PubdefError> {
+    let name_start = *pos;
+    let len = pubdef_read_u8(buf, pos)? as usize;
+
+    if len == 0 {
+        return Err(super::PubdefError::EmptyName(name_start));
+    }
+    if len > 255 {
+        return Err(super::PubdefError::NameTooLong(len));
+    }
+    if *pos + len > buf.len() {
+        return Err(super::PubdefError::UnexpectedEof(*pos));
+    }
+
+    let name = String::from_utf8(buf[*pos..*pos + len].to_vec())
+        .map_err(|_| super::PubdefError::InvalidName)?;
+    *pos += len;
+    Ok(name)
+}
+
+fn pubdef_parse_offset(
+    buf: &[u8],
+    pos: &mut usize,
+    kind: super::PubdefKind,
+) -> core::result::Result<u32, super::PubdefError> {
+    match kind {
+        super::PubdefKind::Pubdef16 => pubdef_read_u16_le(buf, pos).map(|v| v as u32),
+        super::PubdefKind::Pubdef32 => pubdef_read_u32_le(buf, pos),
+    }
+}
+
+fn pubdef_verify_checksum(record_bytes: &[u8]) -> core::result::Result<(), super::PubdefError> {
+    let stored = match record_bytes.last() {
+        Some(&b) => b,
+        None => return Err(super::PubdefError::UnexpectedEof(0)),
+    };
+    if stored == 0x00 {
+        return Ok(());
+    }
+    let sum: u8 = record_bytes
+        .iter()
+        .fold(0u8, |acc, &b| acc.wrapping_add(b));
+    if sum != 0 {
+        let computed = 0u8.wrapping_sub(
+            record_bytes[..record_bytes.len() - 1]
+                .iter()
+                .fold(0u8, |acc, &b| acc.wrapping_add(b)),
+        );
+        return Err(super::PubdefError::ChecksumMismatch { computed, stored });
+    }
+    Ok(())
+}
+
+/// Parse a PUBDEF or PUBDEF32 record from a raw byte slice.
+///
+/// `input` must begin with the 0x90 or 0x91 type byte and include all
+/// bytes through (and including) the trailing checksum byte:
+///
+///   [type:1][length:2][base_group:1-2][base_seg:1-2][base_frame:0 or 2]
+///   ([name_len:1][name:N][offset:2 or 4][type_idx:1-2])* [checksum:1]
+pub fn parse_pubdef_record(input: &[u8]) -> core::result::Result<super::PubdefRecord, super::PubdefError> {
+    let mut pos = 0usize;
+
+    let kind = match pubdef_read_u8(input, &mut pos)? {
+        0x90 => super::PubdefKind::Pubdef16,
+        0x91 => super::PubdefKind::Pubdef32,
+        other => return Err(super::PubdefError::WrongRecordType { found: other }),
+    };
+
+    let record_length = pubdef_read_u16_le(input, &mut pos)? as usize;
+    let record_end = pos + record_length;
+    if record_end > input.len() {
+        return Err(super::PubdefError::UnexpectedEof(input.len()));
+    }
+
+    pubdef_verify_checksum(&input[..record_end])?;
+
+    let base = pubdef_parse_base(input, &mut pos)?;
+
+    let data_end = record_end - 1;
+    let mut entries = Vec::new();
+
+    while pos < data_end {
+        let name = pubdef_parse_name(input, &mut pos)?;
+        let offset = pubdef_parse_offset(input, &mut pos, kind)?;
+        let type_index = pubdef_parse_index(input, &mut pos)?;
+        entries.push(super::PubdefEntry { name, offset, type_index });
+    }
+
+    Ok(super::PubdefRecord { kind, base, entries })
+}
+
+// ── Standalone LPUBDEF parser (spec-level) ─────────────────────────────────
+
+/// Parses an LPUBDEF record (0xB6 or 0xB7).
+///
+/// `record_type` is the byte that identified the record (0xB6 or 0xB7).
+/// `body` is everything that followed the 2-byte Record Length field —
+/// i.e. exactly `Record Length` bytes, still including the trailing
+/// checksum byte.
+pub fn parse_lpubdef(
+    record_type: u8,
+    body: &[u8],
+) -> core::result::Result<super::LpubdefRecord, super::LpubdefParseError> {
+    let offset_width = match record_type {
+        0xB6 => super::OffsetWidth::Bit16,
+        0xB7 => super::OffsetWidth::Bit32,
+        other => return Err(super::LpubdefParseError::InvalidRecordType(other)),
+    };
+
+    if body.is_empty() {
+        return Err(super::LpubdefParseError::UnexpectedEof { expected: 1, remaining: 0 });
+    }
+    let checksum = body[body.len() - 1];
+    let mut cur = LpubdefCursor::new(&body[..body.len() - 1]);
+
+    let base_group = cur.read_index()?;
+    let base_segment = cur.read_index()?;
+
+    let base_frame = if base_segment.0 == 0 {
+        Some(cur.read_u16_le()?)
+    } else {
+        None
+    };
+
+    let mut names = Vec::new();
+    while cur.remaining() > 0 {
+        let name_len = cur.read_u8()? as usize;
+        if name_len == 0 {
+            return Err(super::LpubdefParseError::EmptyName);
+        }
+        let name = cur.read_bytes(name_len)?.to_vec();
+
+        let offset = match offset_width {
+            super::OffsetWidth::Bit16 => cur.read_u16_le()? as u32,
+            super::OffsetWidth::Bit32 => cur.read_u32_le()?,
+        };
+
+        let type_index = cur.read_index()?;
+
+        names.push(super::LocalPublicName { name, offset, type_index });
+    }
+
+    if cur.remaining() != 0 {
+        return Err(super::LpubdefParseError::TrailingBytes { leftover: cur.remaining() });
+    }
+
+    Ok(super::LpubdefRecord { offset_width, base_group, base_segment, base_frame, names, checksum })
+}
+
+struct LpubdefCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> LpubdefCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    fn read_u8(&mut self) -> core::result::Result<u8, super::LpubdefParseError> {
+        let byte = *self
+            .data
+            .get(self.pos)
+            .ok_or(super::LpubdefParseError::UnexpectedEof { expected: 1, remaining: self.remaining() })?;
+        self.pos += 1;
+        Ok(byte)
+    }
+
+    fn read_u16_le(&mut self) -> core::result::Result<u16, super::LpubdefParseError> {
+        self.expect(2)?;
+        let v = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
+        self.pos += 2;
+        Ok(v)
+    }
+
+    fn read_u32_le(&mut self) -> core::result::Result<u32, super::LpubdefParseError> {
+        self.expect(4)?;
+        let bytes = [
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ];
+        self.pos += 4;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_bytes(&mut self, n: usize) -> core::result::Result<&'a [u8], super::LpubdefParseError> {
+        self.expect(n)?;
+        let slice = &self.data[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(slice)
+    }
+
+    fn expect(&self, n: usize) -> core::result::Result<(), super::LpubdefParseError> {
+        if self.remaining() < n {
+            Err(super::LpubdefParseError::UnexpectedEof { expected: n, remaining: self.remaining() })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_index(&mut self) -> core::result::Result<super::OmfIndex, super::LpubdefParseError> {
+        let first = self.read_u8()?;
+        if first & 0x80 == 0 {
+            Ok(super::OmfIndex(first as u16))
+        } else {
+            let second = self.read_u8()?;
+            Ok(super::OmfIndex((((first & 0x7F) as u16) << 8) | second as u16))
+        }
     }
 }

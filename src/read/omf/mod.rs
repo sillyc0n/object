@@ -1,3 +1,4 @@
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Debug;
 
@@ -159,8 +160,8 @@ pub struct ParsedSymbol<'data> {
     pub kind: ParsedSymbolKind,
     /// 1-based SEGDEF ordinal. 0 = absolute or undefined or communal.
     pub seg_ordinal: u16,
-    /// Byte offset within the segment.
-    pub offset: u16,
+    /// Byte offset within the segment (32-bit to support PUBDEF32).
+    pub offset: u32,
 }
 
 /// A parsed TYPDEF record (obsolete compatibility record).
@@ -190,6 +191,492 @@ pub struct ParsedComdefEntry<'data> {
     /// records that immediately follow LEDATA/LIDATA targeting the COMDEF
     /// ordinal space).
     pub relocs: Vec<ParsedReloc>,
+}
+
+// ── COMDEF spec-level types ────────────────────────────────────────────────
+//
+// These types mirror the spec at COMDEF_B0H_Parser_Spec.md and are exposed
+// as a standalone parser alongside the integrated ParsedComdefEntry type.
+
+/// Error type for the standalone COMDEF parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComdefError {
+    /// Unexpected end of input at the given offset.
+    UnexpectedEof(usize),
+    /// Record type byte is not 0xB0.
+    WrongRecordType {
+        /// The actual record type byte found.
+        found: u8,
+    },
+    /// Communal length prefix byte is reserved/invalid.
+    InvalidLengthPrefix(u8),
+    /// Unknown data type byte.
+    UnknownDataType(u8),
+    /// Checksum mismatch.
+    ChecksumMismatch {
+        /// The computed checksum value.
+        computed: u8,
+        /// The stored checksum value from the record.
+        stored: u8,
+    },
+}
+
+/// A single communal variable entry from a COMDEF record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComdefEntry {
+    /// Variable name (empty string is valid).
+    pub name: Vec<u8>,
+    /// Raw type index (not inspected by linkers).
+    pub type_index: u16,
+    /// Placement and size encoding.
+    pub communal: ComdefKind,
+}
+
+/// Size/placement description from the COMDEF Data Type + Length fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComdefKind {
+    /// NEAR data — flat allocation of `size` bytes.
+    Near {
+        /// Total allocation size in bytes.
+        size: u32,
+    },
+    /// FAR data — `count` elements each of `element_size` bytes.
+    Far {
+        /// Number of elements in the FAR array.
+        count: u32,
+        /// Size of each element in bytes.
+        element_size: u32,
+    },
+    /// Borland segment index (Data Type 0x01–0x5F).
+    BorlandSegment {
+        /// Segment index byte value.
+        index: u8,
+    },
+}
+
+/// A fully-parsed COMDEF record.
+#[derive(Debug, Clone)]
+pub struct ComdefRecord {
+    /// Entries parsed from the record.
+    pub entries: Vec<ComdefEntry>,
+}
+
+// ── PUBDEF spec-level types ────────────────────────────────────────────────
+//
+// These types mirror the spec at PUBDEF_90H_91H_Parser_Spec.md and are exposed
+// as a standalone parser alongside the integrated parser in OmfFile.
+
+/// Which PUBDEF variant this record is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PubdefKind {
+    /// 0x90 — 16-bit Public Offset.
+    Pubdef16,
+    /// 0x91 — 32-bit Public Offset.
+    Pubdef32,
+}
+
+/// The base addressing context, shared by all entries in the record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PubdefBase {
+    /// Base Segment Index nonzero: segment-relative (most common).
+    /// group_index may be 0 (no group) or nonzero.
+    Segment {
+        /// Index into the GRPDEF table; 0 = no group.
+        group_index:   u16,
+        /// Index into the SEGDEF table (nonzero).
+        segment_index: u16,
+    },
+    /// Base Segment Index = 0: Base Frame field is present.
+    /// When group_index is also 0, frame defines an absolute symbol.
+    /// When group_index is nonzero, frame is present but ignored.
+    Frame {
+        /// Index into the GRPDEF table; 0 = no group.
+        group_index: u16,
+        /// Frame paragraph number (present only when segment_index == 0).
+        frame:       u16,
+    },
+}
+
+/// A single public name entry within a PUBDEF record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PubdefEntry {
+    /// Public symbol name (1–255 bytes, non-empty).
+    pub name:       String,
+    /// Offset of the symbol within its base context.
+    pub offset:     u32,
+    /// Type index (0 = no type data).
+    pub type_index: u16,
+}
+
+/// A fully-parsed PUBDEF or PUBDEF32 record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PubdefRecord {
+    /// Which variant (16-bit or 32-bit offset).
+    pub kind:    PubdefKind,
+    /// Base addressing context for all entries.
+    pub base:    PubdefBase,
+    /// The public name entries in this record.
+    pub entries: Vec<PubdefEntry>,
+}
+
+/// Error type for the standalone PUBDEF parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PubdefError {
+    /// Unexpected end of input at the given offset.
+    #[allow(dead_code)]
+    UnexpectedEof(usize),
+    /// Record type byte is not 0x90 or 0x91.
+    WrongRecordType {
+        /// The actual record type byte found.
+        found: u8,
+    },
+    /// Public name has zero length.
+    EmptyName(usize),
+    /// Public name length exceeds maximum of 255.
+    NameTooLong(usize),
+    /// Invalid UTF-8 in public name.
+    InvalidName,
+    /// Checksum mismatch.
+    ChecksumMismatch {
+        /// The computed checksum value.
+        computed: u8,
+        /// The stored checksum value from the record.
+        stored: u8,
+    },
+}
+
+// ── LPUBDEF spec-level types ───────────────────────────────────────────────
+//
+// These types mirror the spec at LPUBDEF_B6H_B7H_spec.md and are exposed
+// as a standalone parser.
+
+/// Errors that can occur while parsing a B6H/B7H LPUBDEF record body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LpubdefParseError {
+    /// `record_type` was neither 0xB6 nor 0xB7.
+    InvalidRecordType(u8),
+    /// Ran out of bytes while trying to read `expected` more, with only
+    /// `remaining` left in the buffer.
+    UnexpectedEof {
+        /// Number of additional bytes needed.
+        expected: usize,
+        /// Number of bytes still available.
+        remaining: usize,
+    },
+    /// The field area was fully consumed but `leftover` bytes remained —
+    /// not enough to form another complete name entry.
+    TrailingBytes {
+        /// Number of leftover bytes.
+        leftover: usize,
+    },
+    /// String Length was 0; LPUBDEF names must be non-empty.
+    EmptyName,
+}
+
+/// Whether this record carries 16-bit or 32-bit Local Offset values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetWidth {
+    /// Record type 0xB6.
+    Bit16,
+    /// Record type 0xB7.
+    Bit32,
+}
+
+/// A decoded OMF variable-length index field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OmfIndex(pub u16);
+
+impl OmfIndex {
+    /// Returns true when the index is nonzero (i.e., present/valid).
+    pub fn is_present(self) -> bool {
+        self.0 != 0
+    }
+}
+
+/// One symbol defined inside an LPUBDEF record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPublicName {
+    /// Raw name bytes (OMF doesn't guarantee an encoding).
+    pub name: Vec<u8>,
+    /// Always widened to u32 regardless of source width.
+    pub offset: u32,
+    /// Type index (variable-width OMF index).
+    pub type_index: OmfIndex,
+}
+
+/// A fully decoded B6H/B7H LPUBDEF record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LpubdefRecord {
+    /// Whether offsets are 16-bit or 32-bit.
+    pub offset_width: OffsetWidth,
+    /// Base Group Index (0 = absent).
+    pub base_group: OmfIndex,
+    /// Base Segment Index (0 → absolute / Base Frame follows).
+    pub base_segment: OmfIndex,
+    /// `Some` only when `base_segment` decoded to 0.
+    pub base_frame: Option<u16>,
+    /// The local public name entries.
+    pub names: Vec<LocalPublicName>,
+    /// The raw checksum byte from the record.
+    pub checksum: u8,
+}
+
+// ── COMDAT types ───────────────────────────────────────────────────────────
+
+/// Which COMDAT variant (0xC2 vs 0xC3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombatKind {
+    /// 0xC2 — 16-bit Enumerated Data Offset.
+    Comdat16,
+    /// 0xC3 — 32-bit Enumerated Data Offset.
+    Comdat32,
+}
+
+impl core::ops::BitOr for CombatFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl core::ops::BitAnd for CombatFlags {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self {
+        Self(self.0 & rhs.0)
+    }
+}
+
+/// Flags byte for a COMDAT record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CombatFlags(pub u8);
+
+impl CombatFlags {
+    /// Continuation — data continues a previous COMDAT for this symbol.
+    pub const CONTINUATION: u8 = 0x01;
+    /// Iterated Data — data field uses LIDATA nested-block format.
+    pub const ITERATED_DATA: u8 = 0x02;
+    /// Local — effectively an LCOMDAT (local communal).
+    pub const LOCAL: u8 = 0x04;
+    /// Data in Code — forces COMDAT into root text when overlaid.
+    pub const DATA_IN_CODE: u8 = 0x08;
+
+    /// Create from a raw byte, truncating reserved bits.
+    pub fn from_bits_truncate(bits: u8) -> Self {
+        Self(bits & 0x0F)
+    }
+
+    /// Returns true if the Continuation flag is set.
+    pub fn is_continuation(self) -> bool {
+        self.0 & Self::CONTINUATION != 0
+    }
+
+    /// Returns true if the Iterated Data flag is set.
+    pub fn is_iterated(self) -> bool {
+        self.0 & Self::ITERATED_DATA != 0
+    }
+
+    /// Returns true if the Local flag is set.
+    pub fn is_local(self) -> bool {
+        self.0 & Self::LOCAL != 0
+    }
+
+    /// Returns true if the Data in Code flag is set.
+    pub fn is_data_in_code(self) -> bool {
+        self.0 & Self::DATA_IN_CODE != 0
+    }
+}
+
+/// Selection criteria for COMDAT (high nibble of Attributes byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SelectionCriteria {
+    /// Only one instance allowed.
+    NoMatch    = 0x0,
+    /// Any instance may be selected.
+    PickAny    = 0x1,
+    /// All instances must have the same length.
+    SameSize   = 0x2,
+    /// All instances must have identical checksums.
+    ExactMatch = 0x3,
+}
+
+impl SelectionCriteria {
+    /// Parse from a nibble value (0x0–0xF). Returns None for reserved values.
+    pub fn from_nibble(v: u8) -> Option<Self> {
+        match v & 0x0F {
+            0x0 => Some(Self::NoMatch),
+            0x1 => Some(Self::PickAny),
+            0x2 => Some(Self::SameSize),
+            0x3 => Some(Self::ExactMatch),
+            _   => None,
+        }
+    }
+}
+
+/// Allocation type for COMDAT (low nibble of Attributes byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AllocationType {
+    /// Explicit — allocate in the segment specified by Public Base.
+    Explicit = 0x0,
+    /// Far Code — allocate as CODE16, linker creates segments automatically.
+    FarCode  = 0x1,
+    /// Far Data — allocate as DATA16, linker creates segments automatically.
+    FarData  = 0x2,
+    /// Code32 — allocate as CODE32.
+    Code32   = 0x3,
+    /// Data32 — allocate as DATA32.
+    Data32   = 0x4,
+}
+
+impl AllocationType {
+    /// Parse from a nibble value (0x0–0xF). Returns None for reserved values.
+    pub fn from_nibble(v: u8) -> Option<Self> {
+        match v & 0x0F {
+            0x0 => Some(Self::Explicit),
+            0x1 => Some(Self::FarCode),
+            0x2 => Some(Self::FarData),
+            0x3 => Some(Self::Code32),
+            0x4 => Some(Self::Data32),
+            _   => None,
+        }
+    }
+
+    /// Whether the Public Base field is present for this allocation type.
+    pub fn has_public_base(self) -> bool {
+        matches!(self, Self::Explicit)
+    }
+}
+
+/// COMDAT alignment code (from the Align byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CombatAlign {
+    /// Use value from the associated SEGDEF.
+    UseSegdef  = 0,
+    /// Byte aligned.
+    Byte       = 1,
+    /// Word (2-byte) aligned.
+    Word       = 2,
+    /// Paragraph (16-byte) aligned.
+    Paragraph  = 3,
+    /// Page aligned (Intel: 256 B; IBM OMF: 4096 B).
+    Page       = 4,
+    /// Double word (4-byte) aligned.
+    DoubleWord = 5,
+}
+
+impl CombatAlign {
+    /// Parse from a u8 value, masking to the low 3 bits.
+    pub fn from_u8(v: u8) -> Self {
+        match v & 0x07 {
+            0 => Self::UseSegdef,
+            1 => Self::Byte,
+            2 => Self::Word,
+            3 => Self::Paragraph,
+            4 => Self::Page,
+            5 => Self::DoubleWord,
+            _ => Self::UseSegdef,
+        }
+    }
+}
+
+/// Decoded Attributes byte for a COMDAT record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CombatAttributes {
+    /// Selection criteria (high nibble).
+    pub selection: SelectionCriteria,
+    /// Allocation type (low nibble).
+    pub allocation: AllocationType,
+}
+
+/// Segment base for the Public Base field of a COMDAT record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentBase {
+    /// Nonzero index into the SEGDEF table (1-based).
+    Segment(u16),
+    /// Absolute segment: frame number when segment index = 0.
+    Absolute {
+        /// Frame number (paragraph-aligned base address).
+        frame: u16,
+    },
+}
+
+/// Public Base field for a COMDAT record (present only when Allocation = Explicit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicBase {
+    /// Index into GRPDEF table; 0 = no group.
+    pub group_index: u16,
+    /// The segment base (segment ordinal or absolute frame).
+    pub segment: SegmentBase,
+}
+
+/// Public Name encoding for a COMDAT record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicName {
+    /// Microsoft LINK: OMF index into LNAMES/LLNAMES.
+    Index(u16),
+    /// IBM LINK386: length-prefixed name string.
+    Name(Vec<u8>),
+}
+
+/// Which Public Name encoding to use when parsing COMDAT records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicNameEncoding {
+    /// Microsoft LINK: OMF index (1 or 2 bytes).
+    MicrosoftIndex,
+    /// IBM LINK386: length-prefixed string.
+    IbmString,
+}
+
+/// A fully-parsed COMDAT or COMDAT32 record.
+#[derive(Debug, Clone)]
+pub struct CombatRecord {
+    /// Which variant (16-bit or 32-bit offset).
+    pub kind: CombatKind,
+    /// Flags byte.
+    pub flags: CombatFlags,
+    /// Attributes (selection + allocation).
+    pub attributes: CombatAttributes,
+    /// Alignment.
+    pub align: CombatAlign,
+    /// Byte offset from start of COMDAT symbol to first data byte.
+    pub data_offset: u32,
+    /// Type index (0 = none).
+    pub type_index: u16,
+    /// Public Base, present only when Allocation is Explicit.
+    pub public_base: Option<PublicBase>,
+    /// Public Name identifying the communal symbol.
+    pub public_name: PublicName,
+    /// Raw data bytes (0–1024). Enumerated or iterated per flags.
+    pub data: Vec<u8>,
+    /// Relocations attached to this COMDAT's data (from subsequent FIXUPP).
+    pub relocs: Vec<ParsedReloc>,
+}
+
+/// Error type for the standalone COMDAT parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CombatError {
+    /// Unexpected end of input at the given offset.
+    UnexpectedEof(usize),
+    /// Record type byte is not 0xC2 or 0xC3.
+    WrongRecordType {
+        /// The actual record type byte found.
+        found: u8,
+    },
+    /// Reserved Selection Criteria value.
+    ReservedSelectionCriteria(u8),
+    /// Reserved Allocation Type value.
+    ReservedAllocationType(u8),
+    /// Data payload length exceeds maximum of 1024 bytes.
+    DataTooLong(usize),
+    /// Checksum mismatch.
+    ChecksumMismatch {
+        /// The computed checksum value.
+        computed: u8,
+        /// The stored checksum value from the record.
+        stored: u8,
+    },
 }
 
 /// Communal kind describing NEAR/FAR/Borland segment encodings.
