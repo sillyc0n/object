@@ -46,7 +46,7 @@ pub enum Architecture {
     Wasm64,
     Xtensa,
     /// Intel 8086/8088 with 16-bit segmented addressing.
-    X86_16,
+    I8086,
 }
 
 /// A CPU sub-architecture.
@@ -100,7 +100,7 @@ impl Architecture {
             Architecture::Wasm64 => Some(AddressSize::U64),
             Architecture::Xtensa => Some(AddressSize::U32),
             Architecture::SuperH => Some(AddressSize::U32),
-            Architecture::X86_16 => Some(AddressSize::U16),
+            Architecture::I8086 => Some(AddressSize::U16),
         }
     }
 }

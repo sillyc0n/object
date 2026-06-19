@@ -56,6 +56,8 @@ enum DataTarget {
     pub(super) linsym_records: Vec<super::LinsymRecord>,
     /// Parsed LINNUM (0x94 / 0x95) records.
     pub(super) linnum_records: Vec<super::LinnumRecord>,
+    /// True when this module is OMF386 (32-bit), detected from record types or fixup loc values.
+    pub(super) is_omf32: bool,
     pub(super) marker: PhantomData<&'data ()>,
 }
 
@@ -82,6 +84,7 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
             has_ms_ext: false,
             linsym_records: Vec::new(),
             linnum_records: Vec::new(),
+            is_omf32: false,
             marker: PhantomData,
         };
 
@@ -184,6 +187,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                         eprintln!("About to parse SEGDEF @0x{:X}: body_len={} body_preview={}", pos, record_body.len(), s);
                     }
                     let is_32 = record_type == omf::RT_SEGDEF32;
+                    if is_32 {
+                        self.is_omf32 = true;
+                    }
                     self.parse_segdef(record_body, is_32)?;
                     #[cfg(debug_assertions)]
                     {
@@ -250,10 +256,16 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                         || record_type == omf::RT_LOCAL_PUBDEF32;
                     let is_32 = record_type == omf::RT_PUBDEF32
                         || record_type == omf::RT_LOCAL_PUBDEF32;
+                    if is_32 {
+                        self.is_omf32 = true;
+                    }
                     self.parse_pubdef(record_body, is_local, is_32)?;
                     last_data_target = None;
                 }
                 omf::RT_LINNUM | omf::RT_LINNUM32 => {
+                    if record_type == omf::RT_LINNUM32 {
+                        self.is_omf32 = true;
+                    }
                     let record_bytes = &data[pos..pos + 3 + record_length];
                     let linnum = parse_linnum(record_bytes)
                         .map_err(|_| Error("invalid LINNUM record"))?;
@@ -298,6 +310,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                         }
                     }
                     let is_32 = record_type == omf::RT_LEDATA32;
+                    if is_32 {
+                        self.is_omf32 = true;
+                    }
                     let (target, off) = self.parse_ledata(record_body, is_32)?;
                     last_data_target = Some(target);
                     last_data_seg_offset = off as u32;
@@ -322,6 +337,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     last_data_seg_offset = off as u32;
                 }
                 omf::RT_FIXUPP | omf::RT_FIXUPP32 => {
+                    if record_type == omf::RT_FIXUPP32 {
+                        self.is_omf32 = true;
+                    }
                     self.parse_fixupp(
                         record_body,
                         last_data_target.clone(),
@@ -332,7 +350,10 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     last_data_target = None;
                 }
                 omf::RT_COMDAT | omf::RT_COMDAT32 => {
-                    let _is_32 = record_type == omf::RT_COMDAT32;
+                    let is_32 = record_type == omf::RT_COMDAT32;
+                    if is_32 {
+                        self.is_omf32 = true;
+                    }
                     let name_encoding = super::PublicNameEncoding::MicrosoftIndex;
                     let record_bytes = &data[pos..pos + 3 + record_length];
                     let comdat = super::parse_comdat(record_bytes, name_encoding)
@@ -343,6 +364,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     last_data_seg_offset = 0;
                 }
                 omf::RT_LINSYM | omf::RT_LINSYM32 => {
+                    if record_type == omf::RT_LINSYM32 {
+                        self.is_omf32 = true;
+                    }
                     let name_encoding = super::PublicNameEncoding::MicrosoftIndex;
                     let record_bytes = &data[pos..pos + 3 + record_length];
                     let linsym = parse_linsym(record_bytes, name_encoding)
@@ -357,6 +381,9 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     // type/length header; parse_modend will validate the body
                     // and set the module entry point appropriately.
                     let is_32 = record_type == omf::RT_MODEND32;
+                    if is_32 {
+                        self.is_omf32 = true;
+                    }
                     self.parse_modend(record_body, is_32)?;
                     break;
                 }
@@ -1319,6 +1346,10 @@ impl<'data, R: ReadRef<'data>> OmfFile<'data, R> {
                     other => other as u8,
                 };
 
+                if (loc as u16) == omf::LOC_OFFSET32 {
+                    self.is_omf32 = true;
+                }
+
                 if pos >= body.len() {
                     return Err(Error("truncated FIXUPP fix_dat"));
                 }
@@ -2036,7 +2067,11 @@ impl<'data, R: ReadRef<'data>> Object<'data> for OmfFile<'data, R> {
     type DynamicRelocationIterator<'file> = read::NoDynamicRelocationIterator where Self: 'file, 'data: 'file;
 
     fn architecture(&self) -> Architecture {
-        Architecture::X86_16
+        if self.is_omf32 {
+            Architecture::I386
+        } else {
+            Architecture::I8086
+        }
     }
 
     fn endianness(&self) -> Endianness {

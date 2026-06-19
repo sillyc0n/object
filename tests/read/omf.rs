@@ -27,8 +27,75 @@ fn omf_minimal() {
     data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
     data.extend(make_record(0x8A, &[0x01]));
     let obj = OmfFile::parse(&data[..]).unwrap();
-    assert_eq!(obj.architecture(), Architecture::X86_16);
+    assert_eq!(obj.architecture(), Architecture::I8086);
     assert_eq!(obj.binary_format(), BinaryFormat::Omf);
+}
+
+#[test]
+fn omf32_detection_segdef32() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    // SEGDEF32 (0x99) — ACBP, 32-bit length, name, class, overlay
+    data.extend(make_record(0x99, &[0x28, 0x10, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.architecture(), Architecture::I386);
+}
+
+#[test]
+fn omf32_detection_ledata32() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'D', b'A', b'T', b'A']));
+    data.extend(make_record(0x98, &[0x48, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    // LEDATA32 (0xA1) with 32-bit data offset
+    data.extend(make_record(0xA1, &[0x01, 0x05, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.architecture(), Architecture::I386);
+}
+
+#[test]
+fn omf32_detection_modend32() {
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    // MODEND32 (0x8B) with start address and 32-bit displacement
+    data.extend(make_record(0x8B, &[0xC1, 0x40, 0x01, 0x78, 0x56, 0x34, 0x12]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.architecture(), Architecture::I386);
+}
+
+#[test]
+fn omf32_detection_offset32_reloc() {
+    // A plain FIXUPP (0x9C) with a LOC_OFFSET32 (loc=9) fixup should trigger OMF32.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+    // FIXUPP body with loc=9 (LOC_OFFSET32) at locat=0xE400
+    data.extend(make_record(0x9C, &[0xE4, 0x00, 0x42, 0x01, 0x00, 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.architecture(), Architecture::I386);
+}
+
+#[test]
+fn omf32_detection_fixupp32() {
+    // FIXUPP32 (0x9D) record alone should trigger OMF32 even with 16-bit relocations.
+    let mut data = Vec::new();
+    data.extend(make_record(0x80, &[0x05, b'H', b'E', b'L', b'L', b'O']));
+    data.extend(make_record(0x96, &[0x04, b'C', b'O', b'D', b'E']));
+    data.extend(make_record(0x98, &[0x28, 0x10, 0x00, 0x01, 0x01, 0x01]));
+    data.extend(make_record(0x8C, &[0x04, b'p', b'u', b't', b's', 0x00]));
+    data.extend(make_record(0xA0, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+    // FIXUPP32 (0x9D) with a standard 16-bit offset fixup
+    data.extend(make_record(0x9D, &[0x84, 0x00, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00]));
+    data.extend(make_record(0x8A, &[0x01]));
+    let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.architecture(), Architecture::I386);
 }
 
 #[test]
@@ -352,6 +419,7 @@ fn omf_pubdef32() {
     data.extend(make_record(0x91, &[0x00, 0x01, 0x03, b'b', b'a', b'r', 0x78, 0x56, 0x34, 0x12, 0x00]));
     data.extend(make_record(0x8A, &[0x01]));
     let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.architecture(), Architecture::I386);
     let sym = obj.symbols().find(|s| s.name() == Ok("bar")).unwrap();
     assert_eq!(sym.address(), 0x12345678);
 }
@@ -822,6 +890,7 @@ fn omf_32bit_ignored() {
     data.extend(make_record(0xB7, &[0x00, 0x01, 0x03, b'f', b'o', b'o', 0x02, 0x00, 0x00, 0x00, 0x00]));
     data.extend(make_record(0x8A, &[0x01]));
     let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.architecture(), Architecture::I386);
     assert_eq!(obj.symbols().count(), 1);
     let sym = obj.symbols().next().unwrap();
     assert_eq!(sym.name(), Ok("foo"));
@@ -908,6 +977,7 @@ fn omf_fixupp32() {
     data.extend(make_record(0x9D, &[0xC4, 0x00, 0x40, 0x01, 0x78, 0x56, 0x34, 0x12, 0x84, 0x02, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00]));
     data.extend(make_record(0x8A, &[0x01]));
     let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.architecture(), Architecture::I386);
     let mut relocs = obj.sections().next().unwrap().relocations();
     let r1 = relocs.next().unwrap().1;
     assert_eq!(r1.target(), RelocationTarget::Section(SectionIndex(0)));
@@ -931,6 +1001,7 @@ fn omf_loc32_size() {
     data.extend(make_record(0x9D, &[0xE4, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0xEC, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00]));
     data.extend(make_record(0x8A, &[0x01]));
     let obj = OmfFile::parse(&data[..]).unwrap();
+    assert_eq!(obj.architecture(), Architecture::I386);
     let mut relocs = obj.sections().next().unwrap().relocations();
     let r1 = relocs.next().unwrap().1;
     assert_eq!(r1.size(), 32);

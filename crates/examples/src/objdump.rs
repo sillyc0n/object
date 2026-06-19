@@ -116,12 +116,17 @@ fn dump_object<W: Write, E: Write>(w: &mut W, e: &mut E, data: &[u8]) -> Result<
 }
 
 fn dump_parsed_object<W: Write, E: Write>(w: &mut W, e: &mut E, file: &object::File) -> Result<()> {
+    let bit_width = file
+        .architecture()
+        .address_size()
+        .map(|s| (s.bytes() * 8).to_string())
+        .unwrap_or_else(|| if file.is_64() { "64".into() } else { "32".into() });
     writeln!(
         w,
         "Format: {:?} {:?}-endian {}-bit",
         file.format(),
         file.endianness(),
-        if file.is_64() { "64" } else { "32" }
+        bit_width,
     )?;
     writeln!(w, "Kind: {:?}", file.kind())?;
     writeln!(w, "Architecture: {:?}", file.architecture())?;
